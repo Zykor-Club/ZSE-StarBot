@@ -1,0 +1,59 @@
+# ============================================================
+# ZSE-StarBot 配置文件示例
+# 复制本文件为 config.yaml 后填写；config.yaml 已被 .gitignore 忽略，不会入库
+# 凭证在 QQ 开放平台获取：https://q.qq.com （机器人开发设置）
+# ============================================================
+
+# AppID（机器人 ID）
+appid: "你的AppID"
+
+# AppSecret（机器人的密钥，新版 AccessToken 鉴权用；Token 已废弃无需填）
+secret: "你的AppSecret"
+
+# 监控的群列表：机器人必须是【群管理员】，否则入群申请接口不可用
+# group_openid 的获取方式：
+#   1. 把机器人拉进群后，程序自动打印群 openid 并自动加入轮询（看运行日志）；
+#   2. 或者将机器人拉进群后，在程序日志中把 openid 复制到这里固化。
+groups:
+  - name: "示例群"
+    group_openid: "把机器人拉进群后从日志复制群openid到这里"
+    # 可选：显式指定本群"高级管理员"openid（机器人早已在群里、收不到添加机器人事件时用）。
+    # 不填也没关系：群里发送 `设置高级管理员 <玩家名>`（目标需已绑定白名单）可一次性追授。
+    owner_openid: ""
+
+# 轮询入群申请列表的间隔（秒）。接口限制 30 次/分钟，建议 >=10
+poll_interval_seconds: 10
+
+# 申请卡片标题里的组织名（标题显示为：꧁༺ {apply_title} 入群申请 ༻꧂）
+apply_title: "ZSE联合体"
+
+# starZSEbot 服务端（TShock 插件连接本机器人的端口）
+# 有 NAT 映射时：插件侧 ServerUrl 填「公网IP:公网映射端口」
+zse_server_port: 13140
+
+# 机器人对外称呼（邮件正文/提示里用到）
+bot_name: "猫娘小梦"
+
+# 本机器人的群标识 openid（群消息里 @ 本机器人时正文是 <@本openid>；日志里被 @ 的那串 32 位十六进制即是）。
+# 用于区分"@的是本机器人还是其它机器人"；留空则运行时从 mentions/事件尝试学习。
+bot_openid: ""
+
+# 白名单验证邮件（SMTP 发信）
+smtp:
+  host: "smtp.qq.com"
+  port: 465
+  username: "发件邮箱@qq.com"
+  auth_code: "SMTP授权码"     # QQ邮箱设置中开启SMTP后生成
+  from_name: "ZSE联合体"
+  code_ttl: 300        # 验证码有效期（秒），默认 5 分钟
+  retry_cooldown: 240  # 同一邮箱两次申请的最小间隔（秒），默认 4 分钟
+  max_mail: 5          # 同一邮箱累计成功发送封顶（绑定成功后清零）
+
+# GitHub 动态推送
+github:
+  owner: "Zykor-Club"          # 监控仓库的所属用户/组织
+  repo: "TShockServerPlugin"   # 要监控的仓库名
+  org: ""                      # 综述图是否附带该组织的仓库列表（留空 = 不展示）
+  poll_interval_minutes: 1     # 检测新 Issue / PR / Star 的间隔（分钟）
+  auto_push: true              # 检测到新动态是否主动推送图片到群（发"仓库/pr/issue"随时可查，不受此开关影响）
+  token: ""                    # GitHub 细粒度令牌（Metadata: Read 即可）；不填则 star 用户名显示为"未知用户"

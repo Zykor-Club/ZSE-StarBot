@@ -1,0 +1,35 @@
+# ===== 敏感配置（含密钥，不入库）=====
+config.yaml
+deploy_config.json
+
+# ===== 含服务器连接信息的一次性笔记 =====
+服务器部署指南.md
+
+# ===== 运行时数据 =====
+*.log
+pending.json
+whitelist.json
+starzsebot_fixed.json
+starzsebot_on.json
+
+# ===== 素材与打包产物（体积大，按 README 说明自行准备）=====
+assets/
+_lookbag_assets.zip
+starZSEbot-plugin.zip
+github-bot-deploy.zip
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+
+# ===== 临时 / 一次性诊断文件 =====
+tmp_diag/
+_chunk.b64_part
+diag_*.py
+check_path.ps1
+read_runlog.py
+fix_lock_restart.py
+
+# ===== 预览图 =====
+preview.png
+preview2.png

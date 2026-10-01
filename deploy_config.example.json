@@ -1,0 +1,9 @@
+{
+  "host": "your.server.ip",
+  "port": 22,
+  "user": "Administrator",
+  "key": "C:\\path\\to\\your\\ssh_private_key",
+  "plugin_out_dir": "",
+  "cai_assets_dir": "",
+  "bg_dir": ""
+}
