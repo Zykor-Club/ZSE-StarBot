@@ -55,7 +55,7 @@ from upload_media import send_group_image
 
 _log = logging.get_logger()
 
-CONFIG_PATH = "config.yaml"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 
 # ────────────────── SDK 补丁（自动扩展官方 SDK，不需要改 SDK 源码）──────────────────
 # 当机器人在开放平台开启"接收所有消息"（全量模式）时，群里每条消息以

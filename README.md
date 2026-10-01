@@ -90,24 +90,26 @@
 
 ### 使用步骤
 
-1. **填配置**：复制 `config.example.yaml` 为 `config.yaml`，填入 `appid` 与 `secret`
+1. **填配置**：复制 `bot/config.example.yaml` 为 `bot/config.yaml`，填入 `appid` 与 `secret`
    （QQ 开放平台 https://q.qq.com → 你的机器人 → 开发设置）
-2. **把机器人拉进群**（建议设为管理员），程序日志会自动打印该群的 `group_openid`，可复制回 `config.yaml` 固化
+2. **把机器人拉进群**（建议设为管理员），程序日志会自动打印该群的 `group_openid`，可复制回 `bot/config.yaml` 固化
 3. **群内权限**：机器人需要「接收机器人消息/主动消息」权限（群主/管理员在群设置中开启），否则机器人收不到消息、主动卡片发不出去
 4. **运行**：
 
    ```
-   py main.py
+   py bot/main.py
    ```
 
-5. **（可选）Windows 开机自启**：参考 `register_task.ps1` / `start_bot.ps1` 注册计划任务（脚本内路径按实际修改）
+5. **（可选）Windows 开机自启**：参考 `scripts/server/register_task.ps1` / `scripts/server/start_bot.ps1` 注册计划任务（脚本内路径按实际修改）
 
 ### 部署脚本（可选）
 
-`deploy_main_only.py`、`deploy_permissions.py`、`ssh_remote.py`、`deploy_lookbag_assets.py` 用于把机器人/插件/素材一键上传到 Windows 服务器：
+`scripts/` 下的 `deploy_main_only.py`、`deploy_permissions.py`、`ssh_remote.py`、`deploy_lookbag_assets.py` 用于把机器人/插件/素材一键上传到 Windows 服务器（脚本会把 `bot/` 下的文件平铺上传到服务器 `C:\bot`，与服务器现有目录布局一致）：
 
-1. 复制 `deploy_config.example.json` 为 `deploy_config.json`，填写 SSH 地址/端口/用户名/私钥路径（该文件不会入库）
-2. 例如仅更新机器人代码：`py deploy_main_only.py`
+1. 复制 `scripts/deploy_config.example.json` 为 `scripts/deploy_config.json`，填写 SSH 地址/端口/用户名/私钥路径（该文件不会入库）
+2. 例如仅更新机器人代码：`py scripts/deploy_main_only.py`
+
+`scripts/server/` 下是服务器端运维脚本（计划任务注册、机器人/TShock 启动与重启、依赖安装），按需上传到服务器使用。
 
 ### 配套插件（服务器侧）
 
@@ -131,7 +133,7 @@
 
 ## 配置文件说明
 
-`config.yaml`（示例见 `config.example.yaml`）：
+`bot/config.yaml`（示例见 `bot/config.example.yaml`）：
 
 | 配置项 | 说明 |
 | ---- | ---- |
@@ -148,18 +150,34 @@
 ## 项目结构
 
 ```
-main.py                 机器人主程序（事件处理、指令分发、卡片模板）
-zse_server.py           插件通信服务端（WebSocket + HTTP，服务器注册/地图/背包/白名单回包）
-permissions.py          四身份权限系统（身份读写、权限矩阵、退群冻结/接管）
-whitelist_mail.py       白名单邮箱验证（验证码、频控、邮件池）
-groups_registry.py      多群联合（星状总群/子群、共享服务器）
-lookbag_render.py       查背包图片渲染（Pillow，素材懒加载）
-card_render.py          卡片图片渲染（Pillow）
-github_monitor.py       GitHub 动态监控（Issue / PR / Star）
-upload_media.py         QQ 富媒体上传
-create_panel.py         创建群指令面板（一次性脚本）
-deploy_*.py             部署脚本（见上文"部署脚本"）
-config.example.yaml     配置模板
+bot/                        机器人程序（部署时平铺到服务器 C:\bot）
+├── main.py                 主程序（事件处理、指令分发、卡片模板）
+├── zse_server.py           插件通信服务端（WebSocket + HTTP，服务器注册/地图/背包/白名单回包）
+├── permissions.py          四身份权限系统（身份读写、权限矩阵、退群冻结/接管）
+├── whitelist_mail.py       白名单邮箱验证（验证码、频控、邮件池）
+├── groups_registry.py      多群联合（星状总群/子群、共享服务器）
+├── lookbag_render.py       查背包图片渲染（Pillow，素材懒加载）
+├── card_render.py          卡片图片渲染（Pillow）
+├── github_monitor.py       GitHub 动态监控（Issue / PR / Star）
+├── upload_media.py         QQ 富媒体上传
+└── config.example.yaml     配置模板（复制为 bot/config.yaml）
+
+scripts/                    本机部署工具（Python + paramiko）
+├── deploy_config.py        读取 deploy_config.json 的公共模块
+├── deploy_config.example.json
+├── deploy_main_only.py     上传机器人代码并重启机器人
+├── deploy_permissions.py   上传机器人代码 + 插件 DLL，重启 TShock 与机器人
+├── deploy_lookbag_assets.py  查背包素材打包上传
+├── ssh_remote.py           远程执行命令 / 上传文件的小工具
+├── create_panel.py         创建群指令面板（一次性脚本）
+└── server/                 服务器端脚本（Windows）
+    ├── register_task.ps1   注册开机自启计划任务
+    ├── restart_bot.ps1     重启机器人（计划任务方式）
+    ├── start_bot.ps1       后台启动机器人
+    ├── start_tss.ps1       启动 TShock 服务器
+    └── setup_server.ps1    安装机器人运行依赖
+
+docs/                       项目文档（插件接入指南、官方接口速查）
 ```
 
 ## 素材说明（查背包图标不入库）
@@ -169,8 +187,8 @@ config.example.yaml     配置模板
 需要查背包出图时：
 
 1. 从上述仓库获取 `images/items`、`images/buffs`、`terraria_data/item_id.json`
-2. 在 `deploy_config.json` 中配置 `cai_assets_dir`（CaiBotLite 素材目录）与 `bg_dir`（背景图目录，jpg）
-3. 运行 `py deploy_lookbag_assets.py`：自动生成 `item_names.json`（文字降级用）、打包并上传到服务器 `C:\bot\assets\lookbag`
+2. 在 `scripts/deploy_config.json` 中配置 `cai_assets_dir`（CaiBotLite 素材目录）与 `bg_dir`（背景图目录，jpg）
+3. 运行 `py scripts/deploy_lookbag_assets.py`：自动生成 `item_names.json`（文字降级用）、打包并上传到服务器 `C:\bot\assets\lookbag`
 
 未配置素材时，查背包会自动降级为文字卡（使用 `item_names.json` 的名称映射）。
 
