@@ -12,6 +12,7 @@ import paramiko
 from deploy_config import load_deploy_config
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+BOT_DIR = os.path.join(BASE, "..", "bot")  # 机器人代码目录（对应服务器 C:\bot）
 CFG = load_deploy_config()
 
 cli = paramiko.SSHClient()
@@ -21,7 +22,7 @@ cli.connect(CFG["host"], port=CFG["port"], username=CFG["user"],
 
 sftp = cli.open_sftp()
 for f in ["main.py", "permissions.py", "whitelist_mail.py", "zse_server.py", "groups_registry.py", "config.yaml", "lookbag_render.py", "upload_media.py"]:
-    sftp.put(os.path.join(BASE, f), "C:/bot/" + f)
+    sftp.put(os.path.join(BOT_DIR, f), "C:/bot/" + f)
     print("上传 OK:", f)
 sftp.close()
 

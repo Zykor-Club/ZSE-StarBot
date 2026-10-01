@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """创建 QQ 机器人集团令面板（/v2/panels），作用于 config.yaml 中已配置的监控群（specific）。一次性脚本。
 
-凭证与群列表均从同目录 config.yaml 读取，避免把 AppSecret 写进代码。
+凭证与群列表均从 ../bot/config.yaml 读取，避免把 AppSecret 写进代码。
 """
 import json
 import os
@@ -10,7 +10,8 @@ import urllib.request
 import yaml
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(BASE, "config.yaml"), "r", encoding="utf-8") as fp:
+CONFIG_PATH = os.path.join(BASE, "..", "bot", "config.yaml")
+with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
     CONFIG = yaml.safe_load(fp)
 
 APPID = str(CONFIG["appid"])

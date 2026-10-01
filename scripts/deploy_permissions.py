@@ -12,6 +12,7 @@ import paramiko
 from deploy_config import load_deploy_config
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+BOT_DIR = os.path.join(BASE, "..", "bot")  # 机器人代码目录（对应服务器 C:\bot）
 CFG = load_deploy_config()
 
 cli = paramiko.SSHClient()
@@ -21,11 +22,11 @@ cli.connect(CFG["host"], port=CFG["port"], username=CFG["user"],
 
 sftp = cli.open_sftp()
 files = [
-    (os.path.join(BASE, "permissions.py"), "C:/bot/permissions.py"),
-    (os.path.join(BASE, "whitelist_mail.py"), "C:/bot/whitelist_mail.py"),
-    (os.path.join(BASE, "zse_server.py"), "C:/bot/zse_server.py"),
-    (os.path.join(BASE, "main.py"), "C:/bot/main.py"),
-    (os.path.join(BASE, "config.yaml"), "C:/bot/config.yaml"),
+    (os.path.join(BOT_DIR, "permissions.py"), "C:/bot/permissions.py"),
+    (os.path.join(BOT_DIR, "whitelist_mail.py"), "C:/bot/whitelist_mail.py"),
+    (os.path.join(BOT_DIR, "zse_server.py"), "C:/bot/zse_server.py"),
+    (os.path.join(BOT_DIR, "main.py"), "C:/bot/main.py"),
+    (os.path.join(BOT_DIR, "config.yaml"), "C:/bot/config.yaml"),
 ]
 
 # 插件 DLL（可选）：在 deploy_config.json 的 plugin_out_dir 中编译输出 starZSEbot.dll
