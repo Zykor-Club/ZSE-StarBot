@@ -21,8 +21,8 @@ KEY = CFG["key"]
 def run(commands: list, timeout: int = 60) -> None:
     cli = paramiko.SSHClient()
     cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    key = paramiko.RSAKey.from_private_key_file(KEY)
-    cli.connect(HOST, PORT, USER, pkey=key, timeout=15)
+    # key_filename 让 paramiko 自动识别密钥类型（RSA/ed25519 均可）
+    cli.connect(HOST, PORT, USER, key_filename=KEY, timeout=15)
     for cmd in commands:
         print(f"\n$ {cmd}")
         stdin, stdout, stderr = cli.exec_command(cmd, timeout=timeout)
@@ -39,8 +39,7 @@ def upload(local: str, remote: str) -> None:
     """SFTP 上传文件到服务器"""
     cli = paramiko.SSHClient()
     cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    key = paramiko.RSAKey.from_private_key_file(KEY)
-    cli.connect(HOST, PORT, USER, pkey=key, timeout=15)
+    cli.connect(HOST, PORT, USER, key_filename=KEY, timeout=15)
     sftp = cli.open_sftp()
     sftp.put(local, remote)
     size = os.path.getsize(local)

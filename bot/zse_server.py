@@ -48,6 +48,12 @@ def decode_map_png(compressed_b64: str) -> bytes:
     return base64.b64decode(inner_b64)
 
 
+def decode_archive_zip(compressed_b64: str) -> bytes:
+    """插件存档回包 base64 = gzip(base64(zip 字节))；逐层解压还原出 zip 字节"""
+    inner_b64 = gzip.decompress(base64.b64decode(compressed_b64)).decode("utf-8")
+    return base64.b64decode(inner_b64)
+
+
 class ZseServer:
     """starZSEbot 协议服务端，与 QQ 机器人 main.py 共用同一个事件循环"""
 
@@ -70,6 +76,10 @@ class ZseServer:
         self.pending = pending or PendingStore()
         # 群注册表（由 main.py 注入）：联合区数据归总群判定用
         self.registry = None
+        # 进度提醒推送回调（由 main.py 注入）：插件首杀推送 → 播报到订阅群
+        self.on_progress_notify = None
+        # 设备登录请求推送回调（由 main.py 注入）：判定 need_login → 推送带按钮的请求卡
+        self.on_need_login = None
         self._load()
 
     # ───────────────────────── 数据持久化 ─────────────────────────
@@ -79,13 +89,13 @@ class ZseServer:
                 self._data = json.load(f)
         except (OSError, json.JSONDecodeError):
             self._data = {}
-        # 多群联合迁移：缺 owner_gid / shared_gids / version 的记录补齐（幂等，重复加载不会重复处理）
+        # 多群联合迁移：缺 owner_gid / version 的记录补齐（幂等，重复加载不会重复处理）
         for ogid, records in self._data.items():
             for rec in records:
                 if not rec.get("owner_gid"):
                     rec["owner_gid"] = ogid
-                rec.setdefault("shared_gids", [])
                 rec.setdefault("version", "")
+                rec["online"] = False  # 重启后一律先视为离线，等插件重连后再置在线
         self._rebuild_index()
 
     async def _save(self):
@@ -94,6 +104,16 @@ class ZseServer:
                 atomic_write_json(self.bind_file, self._data)
             except OSError as e:
                 print(f"[starZSEbot-server] 保存 bindings.json 失败: {e}")
+
+    async def _update_server_name(self, rec: dict, name: str):
+        """把服务器名写回归属群的真实记录（共享来的记录只是内存拷贝），变化时落盘"""
+        if not name:
+            return
+        entry = self._by_token.get(rec.get("token") or "")
+        target = entry[1] if entry else rec
+        if target.get("server_name") != name:
+            target["server_name"] = name
+            await self._save()
 
     def _rebuild_index(self):
         """扫描登记记录，重建 token 索引（启动/加载后调用）"""
@@ -123,7 +143,6 @@ class ZseServer:
             "bound": False, "online": False, "heartbeat_at": 0.0,
             "added_by": added_by or "",
             "owner_gid": gid,
-            "shared_gids": [],
             "version": "",
         })
         await self._save()
@@ -159,32 +178,29 @@ class ZseServer:
         return [r for r in self._data.get(gid, []) if r.get("owner_gid") == gid]
 
     def visible_records(self, gid: str):
-        """本群可见的服务器：本群拥有的 + 其他群共享给本群的。
-        共享来的记录附加临时标记 rec_shared_by=owner_gid（仅内存，不落盘）。"""
+        """本群可见的服务器：本群拥有的 + 同一联合区内其它群的全部服务器（网状可见，无需共享授权）。
+        跨群记录附加临时标记 rec_shared_by=归属群 openid（仅内存，不落盘，用于显示"来自群id：x"）。"""
         gid = gid or "nogroup"
         recs = list(self.list_servers(gid))
-        for ogid, rs in self._data.items():
-            if ogid == gid:
-                continue
-            for r in rs:
-                if gid in (r.get("shared_gids") or []):
-                    copy = dict(r)          # 拷贝，不污染磁盘数据
-                    copy["rec_shared_by"] = ogid
-                    recs.append(copy)
+        if self.registry is None:
+            return recs
+        others = [g for g in (self.registry.zone_gids(gid) or set()) if g and g != gid]
+        # 按群ID排序，保证展示序号稳定
+        others.sort(key=lambda g: (self.registry.join_id_of(g) or 10 ** 9, g))
+        for ogid in others:
+            for r in self.list_servers(ogid):
+                copy = dict(r)          # 拷贝，不污染磁盘数据
+                copy["rec_shared_by"] = ogid
+                recs.append(copy)
         return recs
 
-    def clear_shared(self, gid: str):
-        """解除联合：遍历全部群的记录，把 gid 从每台服务器的 shared_gids 中移除并保存"""
-        gid = gid or "nogroup"
-        changed = False
-        for records in self._data.values():
-            for rec in records:
-                sg = rec.get("shared_gids")
-                if sg and gid in sg:
-                    rec["shared_gids"] = [x for x in sg if x != gid]
-                    changed = True
-        if changed:
-            asyncio.ensure_future(self._save())
+    def record_by_seq(self, gid: str, seq: int):
+        """按“展示序号”解析记录：序号 = 服务器列表/在线卡里显示的位置号（自有在前、其它群的在后）。
+        找不到返回 None。"""
+        if not isinstance(seq, int):
+            return None
+        recs = self.visible_records(gid)
+        return recs[seq - 1] if 1 <= seq <= len(recs) else None
 
     async def query_online(self, gid: str, timeout: float = 6.0):
         """在线：并行对本群所有在线插件发 player_list + progress 请求，汇总应答。
@@ -215,12 +231,15 @@ class ZseServer:
                 asyncio.wait_for(pl_fut, timeout=timeout),
                 asyncio.wait_for(pr_fut, timeout=timeout),
             )
-            rec["server_name"] = pl_payload.get("server_name", rec.get("server_name", ""))
+            name = pl_payload.get("server_name", rec.get("server_name", ""))
+            rec["server_name"] = name
+            await self._update_server_name(rec, name)
             info = dict(pl_payload)
             info["enable_whitelist"] = rec.get("whitelist")
             info.update(pr_payload or {})
             return rec, "ok", info
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, OSError, RuntimeError):
+            # 连接中断（ws 关闭中 / 写失败）也按超时处理，避免单台异常拖垮整个"在线"指令
             return rec, "timeout", None
         finally:
             self._pending.pop(pl_id, None)
@@ -255,7 +274,11 @@ class ZseServer:
         返回 [(rec, status, info)]，info 含插件回包 payload（base64=压缩地图）。
         status: "ok" | "timeout" | "offline"
         """
-        recs = [r for r in self.visible_records(gid) if seq is None or r.get("seq") == seq]
+        if seq is None:
+            recs = self.visible_records(gid)
+        else:
+            rec = self.record_by_seq(gid, seq)
+            recs = [rec] if rec is not None else []
         return await asyncio.gather(*(self._query_one_map(r, timeout) for r in recs))
 
     async def _query_one_map(self, rec: dict, timeout: float) -> tuple:
@@ -271,9 +294,12 @@ class ZseServer:
         try:
             await self._send_map_image(ws, req_id)
             payload = await asyncio.wait_for(fut, timeout=timeout)
-            rec["server_name"] = payload.get("server_name") or rec.get("server_name", "")
+            name = payload.get("server_name") or rec.get("server_name", "")
+            rec["server_name"] = name
+            await self._update_server_name(rec, name)
             return rec, "ok", payload
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, OSError, RuntimeError):
+            # 连接中断同样按超时处理，避免单台异常拖垮整条地图指令
             return rec, "timeout", None
         finally:
             self._pending.pop(req_id, None)
@@ -283,10 +309,10 @@ class ZseServer:
 
         返回 (rec, status, payload)：status = "ok" | "timeout" | "offline" | "notfound"
         """
-        recs = [r for r in self.visible_records(gid) if r.get("seq") == seq]
-        if not recs:
+        rec = self.record_by_seq(gid, seq)
+        if rec is None:
             return None, "notfound", None
-        return await self._query_one_lookbag(recs[0], player_name, timeout)
+        return await self._query_one_lookbag(rec, player_name, timeout)
 
     async def _query_one_lookbag(self, rec: dict, player_name: str, timeout: float) -> tuple:
         """单台服务器的背包查询"""
@@ -302,7 +328,8 @@ class ZseServer:
             await self._send_lookbag(ws, req_id, player_name)
             payload = await asyncio.wait_for(fut, timeout=timeout)
             return rec, "ok", payload
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, OSError, RuntimeError):
+            # 连接中断同样按超时处理，避免单台异常拖垮整条查背包指令
             return rec, "timeout", None
         finally:
             self._pending.pop(req_id, None)
@@ -362,8 +389,10 @@ class ZseServer:
                     continue
                 await self._handle_package(gid, rec, token, pkg, ws)
         finally:
-            self._ws_by_token.pop(token, None)
-            rec["online"] = False
+            # 仅当映射仍是本条连接时才清理：旧连接的收尾不能误删重连后的新连接
+            if self._ws_by_token.get(token) is ws:
+                self._ws_by_token.pop(token, None)
+                rec["online"] = False
             print(f"[starZSEbot-server] 插件断开: {rec['ip']}:{rec['port']}")
 
         return ws
@@ -388,8 +417,19 @@ class ZseServer:
         elif ptype == "whitelist":
             # 玩家进服：插件发来玩家信息，BOT 判定白名单结果并回包
             await self._handle_whitelist(rec, payload, ws)
-        elif ptype in ("player_list", "progress", "map_image", "call_command", "look_bag"):
-            # 插件对在线/地图/背包等请求的应答（应答包带同样的 request_id 与 is_request）
+        elif ptype == "progress_notify":
+            # 插件主动推送：某 boss 本世界首次被击杀 → 交由 main.py 播报到订阅群
+            cb = self.on_progress_notify
+            if cb is not None:
+                async def _fire_notify(cb=cb, rec=dict(rec), payload=dict(payload)):
+                    try:
+                        await cb(rec, payload)
+                    except Exception as e:
+                        print(f"[starZSEbot-server] 进度播报处理异常: {e}")
+                asyncio.create_task(_fire_notify())
+        elif ptype in ("player_list", "progress", "map_image", "call_command", "look_bag",
+                       "auto_reset", "archive_export"):
+            # 插件对在线/地图/背包/种子配置/存档导出等请求的应答（应答包带同样的 request_id 与 is_request）
             req_id = pkg.get("request_id")
             fut = self._pending.get(req_id) if req_id else None
             if fut and not fut.done():
@@ -454,22 +494,43 @@ class ZseServer:
 
     # ───────────────────────── 白名单进服判定 ─────────────────────────
     async def _handle_whitelist(self, rec: dict, payload: dict, ws: web.WebSocketResponse):
-        """玩家进服白名单判定。插件发 {player_name, player_ip, player_uuid}，BOT 回 whitelist_result。
+        """玩家进服白名单判定。插件发 {player_name, player_ip, player_uuid, player_platform}，BOT 回 whitelist_result。
         联合区数据归总群：判定只用服务器归属群所在的【总群】白名单（effective_gid）。
-        need_login 待批准记录写入总群，玩家在总群/任一联合群发"登录 玩家名"可批准。"""
+        need_login 待批准记录写入总群，玩家在总群/任一联合群发"登录"可批准（一步批准）。"""
         try:
             player_name = (payload.get("player_name") or "").strip()
             player_uuid = (payload.get("player_uuid") or "").strip()
+            player_ip = (payload.get("player_ip") or "").strip()
+            player_platform = (payload.get("player_platform") or "").strip()
             if not player_name:
                 await self._send_whitelist(ws, "", "unknown")
                 return
             owner = rec.get("owner_gid") or ""
             eff_gid = self.registry.effective_gid(owner) if self.registry else owner
-            result, _reg = self.whitelist.check(eff_gid, player_name, player_uuid)
+            city = self.whitelist.resolve_city(player_ip)  # 解析失败返回空串，城市校验自动跳过
+            result, _reg, reason = self.whitelist.check(eff_gid, player_name, player_uuid,
+                                                        player_platform, city)
             if result == "need_login":
-                # 换设备进服：待批准记录写入总群，玩家在总群/任一联合群发"登录 玩家名"可批准
-                self.pending.record(eff_gid, player_name, player_uuid, payload.get("player_ip") or "")
-            print(f"[starZSEbot-server] 白名单判定: {player_name} -> {result} (归属群 {owner[:8]}.../总群 {eff_gid[:8]}...)")
+                # 换设备进服：待批准记录写入总群，玩家在总群/任一联合群发"登录"可批准
+                self.pending.record(eff_gid, player_name, player_uuid, player_ip,
+                                    platform=player_platform, city=city, reason=reason)
+                # 推送带「登录/拒绝」按钮的请求卡（群未开主动消息权限时 main.py 侧静默跳过）
+                cb = self.on_need_login
+                if cb is not None:
+                    info = {
+                        "gid": eff_gid, "player_name": player_name, "uuid": player_uuid,
+                        "ip": player_ip, "platform": player_platform, "city": city,
+                        "reason": reason, "ts": int(time.time()),
+                    }
+
+                    async def _fire_login_cb(cb=cb, rec=dict(rec), info=info):
+                        try:
+                            await cb(rec, info)
+                        except Exception as e:
+                            print(f"[starZSEbot-server] 登录请求推送处理异常: {e}")
+
+                    asyncio.create_task(_fire_login_cb())
+            print(f"[starZSEbot-server] 白名单判定: {player_name} -> {result}({reason}) 平台 {player_platform or '-'} 城市 {city or '-'} (归属群 {owner[:8]}.../总群 {eff_gid[:8]}...)")
             await self._send_whitelist(ws, player_name, result)
         except Exception as e:
             print(f"[starZSEbot-server] 白名单判定异常: {e}")
@@ -490,15 +551,9 @@ class ZseServer:
         }))
 
     # ───────────────────────── 远程广播 / 远程执行 ─────────────────────────
-    def _find_by_seq(self, gid: str, seq: int):
-        for rec in self.visible_records(gid):
-            if rec.get("seq") == seq:
-                return rec
-        return None
-
     async def send_say(self, gid: str, seq: int, content: str) -> bool:
         """向指定服务器广播（= 服务器内 /say）。返回是否已发出（离线/不存在 False）"""
-        rec = self._find_by_seq(gid, seq)
+        rec = self.record_by_seq(gid, seq)
         if rec is None:
             return False
         token = rec.get("token")
@@ -519,7 +574,7 @@ class ZseServer:
                            user_openid: str, group_openid: str,
                            timeout: float = 15.0) -> tuple[bool, str]:
         """远程执行：向指定服务器发 call_command，等待 output 回包。返回 (ok, 结果文本)"""
-        rec = self._find_by_seq(gid, seq)
+        rec = self.record_by_seq(gid, seq)
         if rec is None:
             return False, "找不到该服务器"
         token = rec.get("token")
@@ -545,11 +600,74 @@ class ZseServer:
             }))
             payload = await asyncio.wait_for(fut, timeout=timeout)
             output = payload.get("output") or ""
+            if isinstance(output, list):  # 插件回包为逐行输出列表，拼成整段文本
+                output = "\n".join(str(line) for line in output)
             return True, output.strip() or "（无输出）"
         except asyncio.TimeoutError:
             return False, "执行超时（服务器无回包）"
         finally:
             self._pending.pop(req_id, None)
+
+    # ───────────────────────── AutoResetPlus / 存档导出 ─────────────────────────
+    def _rec_by_code(self, server_code):
+        """按服务器标识（绑定码 code，全局唯一）解析登记记录；找不到返回 None"""
+        if not server_code:
+            return None
+        for records in self._data.values():
+            for rec in records:
+                if rec.get("code") == server_code:
+                    return rec
+        return None
+
+    async def _request_plugin(self, server_code: str, ptype: str, payload: dict,
+                              timeout: float):
+        """向指定服务器（按 code 标识）发一个 is_request 包并等待回包。
+
+        返回 (ok, data)：ok=True 时 data 为回包 payload(dict)；失败时 data 为错误文案(str)，
+        覆盖「服务器不存在」「离线」「超时」三种情况。
+        """
+        rec = self._rec_by_code(server_code)
+        if rec is None:
+            return False, "找不到该服务器"
+        token = rec.get("token")
+        ws = self._ws_by_token.get(token) if token else None
+        if ws is None or ws.closed:
+            return False, "服务器离线"
+        loop = asyncio.get_running_loop()
+        req_id = str(uuid.uuid4())
+        fut = loop.create_future()
+        self._pending[req_id] = fut
+        try:
+            await ws.send_str(json.dumps({
+                "version": "0.1.0",
+                "direction": "to_server",
+                "type": ptype,
+                "is_request": True,
+                "request_id": req_id,
+                "payload": payload or {},
+            }))
+            result = await asyncio.wait_for(fut, timeout=timeout)
+            return True, result
+        except asyncio.TimeoutError:
+            return False, "请求超时（服务器无回包）"
+        finally:
+            self._pending.pop(req_id, None)
+
+    async def request_auto_reset(self, server_code: str, action: str, seed: str = None,
+                                 timeout: float = 15.0):
+        """AutoResetPlus 桥接请求：action ∈ get_config/set_seed/do_reset。返回 (ok, data)"""
+        payload = {"action": action}
+        if seed is not None:
+            payload["seed"] = seed
+        return await self._request_plugin(server_code, "auto_reset", payload, timeout)
+
+    async def request_archive_export(self, server_code: str, timeout: float = 300.0):
+        """存档导出请求（打包较慢，默认 300 秒超时）。返回 (ok, data)"""
+        return await self._request_plugin(server_code, "archive_export", {}, timeout)
+
+    async def request_progress(self, server_code: str, timeout: float = 15.0):
+        """进度查询请求（boss 击杀情况）。返回 (ok, data)"""
+        return await self._request_plugin(server_code, "progress", {}, timeout)
 
     # ───────────────────────── 辅助 ─────────────────────────
     def _find_by_code(self, code: str):

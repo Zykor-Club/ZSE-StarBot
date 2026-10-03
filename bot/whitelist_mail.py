@@ -16,6 +16,7 @@ import os
 import random
 import re
 import smtplib
+import struct
 import tempfile
 import time
 from email.header import Header
@@ -26,11 +27,22 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 VERIFY_FILE = os.path.join(_BASE, "verify.json")
 WHITELIST_FILE = os.path.join(_BASE, "whitelist.json")
 PENDING_FILE = os.path.join(_BASE, "pending.json")
+CHANGES_FILE = os.path.join(_BASE, "whitelist_changes.json")
 
 # 默认规则（可被 config 覆盖）
 CODE_TTL = 300          # 验证码有效期 5 分钟
 RETRY_COOLDOWN = 240    # 同一邮箱 4 分钟限发 1 封
 MAX_MAIL_PER_EMAIL = 5  # 同一邮箱累计成功发送封顶
+
+# 白名单变更规则
+RENAME_COOLDOWN = 48 * 3600        # 修改玩家名：48 小时内限一次
+EMAIL_CHANGE_COOLDOWN = 7 * 86400  # 邮箱改绑：7 天内限一次
+EMAIL_CHANGE_TTL = 24 * 3600       # 邮箱改绑须 24 小时内完成，否则自动回滚原白名单
+
+# 设备登录校验（可在 config.yaml 的 device_check 段覆盖）
+DEVICE_CITY_CHECK = True                              # 城市（IP 跨市级变动）校验总开关
+CITY_MAX = 3                                          # 每个白名单记录的常用城市上限（LRU 超出淘汰最久未用）
+IP2REGION_XDB = os.path.join(_BASE, "ip2region.xdb")  # ip2region 离线库默认路径（bot 目录）
 
 
 def atomic_write_json(path: str, data: dict):
@@ -193,13 +205,198 @@ class VerifyManager:
         return True, "验证通过", email
 
 
+class CityResolver:
+    """ip2region 离线 IP 库（数据文件来自 lionsoul2014/ip2region，兼容两种结构版本）：
+    IPv4 -> 城市名，用于判定"IP 跨市级变动"。
+    文件结构：Header(256B) + 向量索引(256×256×8B) + 段索引(每条14B) + 数据段（两种结构一致）。
+    段数据字段：结构v2（旧 ip2region.xdb）「国家|区域|省份|城市|ISP」城市在索引3；
+                结构v3（新 ip2region_v4.xdb）「国家|省份|城市|ISP|国家代码」城市在索引2。
+    文件缺失/越界/无城市字段一律返回空串（上层自动跳过城市校验，不影响进服）。"""
+
+    _HEADER_LEN = 256     # 文件头长度
+    _VECTOR_SIZE = 8      # 向量索引每条：startPtr(4) + endPtr(4)
+    _VECTOR_COLS = 256    # 向量索引列数（每行 256 条）
+    _SEGMENT_SIZE = 14    # 段索引每条：sip(4) + eip(4) + dataLen(2) + dataPtr(4)
+
+    def __init__(self, path: str = ""):
+        self.path = path or IP2REGION_XDB
+        self._data = b""
+        self._available = False
+        self._city_idx = 3  # 段数据中城市字段索引：结构v2=3，结构v3=2（见类注释）
+        self._cache: dict = {}  # {ip: 城市}：常用 IP 直接复用，避免重复二分
+        try:
+            with open(self.path, "rb") as f:
+                data = f.read()
+            if len(data) > self._HEADER_LEN + self._VECTOR_COLS * self._VECTOR_SIZE:
+                self._data = data
+                self._available = True
+                # Header 偏移0的 u16(LE) 为结构版本号（官方 Header.version）：>=3 为「国家|省份|城市|ISP|国家代码」
+                ver = struct.unpack_from("<H", data, 0)[0]
+                self._city_idx = 2 if ver >= 3 else 3
+        except OSError:
+            pass
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def lookup(self, ip: str) -> str:
+        """返回城市名（如「深圳市」）；无法解析或无城市信息返回空串"""
+        if not self._available:
+            return ""
+        if ip in self._cache:
+            return self._cache[ip]
+        city = self._search(ip)
+        if len(self._cache) > 1024:
+            self._cache.clear()
+        self._cache[ip] = city
+        return city
+
+    def _search(self, ip: str) -> str:
+        try:
+            v = self._ip_to_int(ip)
+            if v < 0:
+                return ""
+            # ① 向量索引：按 IP 前两字节定位该网段的段索引区间
+            idx = self._HEADER_LEN + (((v >> 24) & 0xFF) * self._VECTOR_COLS + ((v >> 16) & 0xFF)) * self._VECTOR_SIZE
+            s_ptr, e_ptr = struct.unpack_from("<II", self._data, idx)
+            if s_ptr == 0 or e_ptr == 0 or e_ptr <= s_ptr:
+                return ""
+            # ② 段索引二分查找命中的 IP 段
+            lo, hi = 0, (e_ptr - s_ptr) // self._SEGMENT_SIZE
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                pos = s_ptr + mid * self._SEGMENT_SIZE
+                sip, eip, dlen, dptr = struct.unpack_from("<IIHI", self._data, pos)
+                if v < sip:
+                    hi = mid - 1
+                elif v > eip:
+                    lo = mid + 1
+                else:
+                    # ③ 段数据：取城市字段（结构v2 索引3 / 结构v3 索引2）
+                    region = self._data[dptr:dptr + dlen].decode("utf-8", "ignore")
+                    fields = region.split("|")
+                    city = fields[self._city_idx].strip() if len(fields) > self._city_idx else ""
+                    return "" if city in ("", "0") else city
+            return ""
+        except (struct.error, IndexError):
+            return ""
+
+    @staticmethod
+    def _ip_to_int(ip: str) -> int:
+        """点分十进制 IP -> 32 位整数（非法返回 -1）"""
+        parts = (ip or "").strip().split(".")
+        if len(parts) != 4:
+            return -1
+        value = 0
+        for p in parts:
+            if not p.isdigit() or len(p) > 3 or int(p) > 255:
+                return -1
+            value = (value << 8) | int(p)
+        return value
+
+
 class WhitelistStore:
-    """白名单数据：{群openid: {玩家名: {email, bind_time, uuid}}}"""
+    """白名单数据：{群openid: {玩家名: {email, bind_time, uuid, bind_openid, frozen,
+    devices: [{uuid, platform, first_seen, last_seen}], cities: [{city, ts}]}}}
+    - devices：该玩家登记过的设备（每个设备一条 UUID，多设备互不顶）
+    - cities：常用城市集合（≤ city_max 个，LRU 淘汰最久未用）"""
 
     def __init__(self, path: str = WHITELIST_FILE):
         self.path = path
         self._data: dict = {}
+        self._changes = None  # ChangeStore（邮箱改绑超时回滚用），由 attach_changes 注入
+        self._city_check = DEVICE_CITY_CHECK  # 城市校验开关（配置注入，见 configure_device_check）
+        self._city_max = CITY_MAX             # 常用城市上限
+        self._city: CityResolver | None = None
         self._load()
+
+    def attach_changes(self, changes: "ChangeStore"):
+        """注入变更事务存储：check/check_multi 判定前会做一次懒回滚（过期改绑→恢复原白名单）"""
+        self._changes = changes
+
+    def configure_device_check(self, enabled: bool = DEVICE_CITY_CHECK,
+                               xdb_path: str = "", city_max: int = CITY_MAX):
+        """注入设备校验配置（main.py 启动时从 config.yaml 的 device_check 段读取）"""
+        self._city_check = bool(enabled)
+        self._city_max = max(1, int(city_max or CITY_MAX))
+        if self._city_check:
+            self._city = CityResolver(xdb_path or IP2REGION_XDB)
+            if not self._city.available:
+                print(f"[whitelist] ip2region 离线库不可用（{self._city.path}），IP 跨市校验自动跳过")
+
+    def resolve_city(self, ip: str) -> str:
+        """解析 IP 所在城市；离线库不可用或解析失败返回空串（上层自动跳过城市校验）"""
+        if self._city is None:
+            return ""
+        return self._city.lookup(ip)
+
+    # ────────────── 设备 / 城市（多设备登记 + 常用城市 LRU） ──────────────
+    @staticmethod
+    def _devices(rec: dict) -> list:
+        """取设备列表；旧数据（只有 uuid 字段）就地迁移成一条设备记录"""
+        devices = rec.get("devices")
+        if not isinstance(devices, list):
+            devices = []
+            legacy = (rec.get("uuid") or "").strip()
+            if legacy:
+                ts = int(rec.get("last_join_time") or rec.get("bind_time") or time.time())
+                devices.append({"uuid": legacy, "platform": "", "first_seen": ts, "last_seen": ts})
+            rec["devices"] = devices
+        return devices
+
+    @staticmethod
+    def _cities(rec: dict) -> list:
+        cities = rec.get("cities")
+        if not isinstance(cities, list):
+            cities = []
+            rec["cities"] = cities
+        return cities
+
+    def _city_known(self, rec: dict, city: str) -> bool:
+        """城市是否在常用城市集合内。集合为空（无历史基线，如旧数据迁移/从未留过城市）视为通过：
+        没有基线就谈不上"变动"，避免老白名单首次进服被误判跨市；首登会由 check 建立基线"""
+        cities = self._cities(rec)
+        if not cities:
+            return True
+        return any(c.get("city") == city for c in cities)
+
+    def _city_touch(self, rec: dict, city: str):
+        """记入/刷新常用城市（LRU：超出上限时淘汰最久未用的一条）"""
+        if not city:
+            return
+        cities = self._cities(rec)
+        now = int(time.time())
+        for c in cities:
+            if c.get("city") == city:
+                c["ts"] = now
+                return
+        cities.append({"city": city, "ts": now})
+        if len(cities) > self._city_max:
+            cities.sort(key=lambda c: int(c.get("ts") or 0))
+            del cities[:len(cities) - self._city_max]
+
+    def _judge(self, rec: dict, uuid: str, platform: str, city: str) -> tuple[str, str]:
+        """只读判定一条记录的设备/城市是否放行。返回 (result, reason)：
+        设备命中 → 城市命中（或城市校验关闭/城市解析失败）放行，不在集合 → ip_change；
+        设备未命中 → 无任何设备（首次）放行，否则 need_login（同平台+城市命中=uuid_change，否则 new_device）"""
+        if rec.get("frozen"):
+            return "frozen", ""
+        devices = self._devices(rec)
+        if rec.get("need_relogin"):
+            return "need_login", "new_device"  # 改名后：设备已清空，强制重新确认登录
+        if not uuid:
+            return "accept", ""  # 客户端未上报 UUID：维持旧行为放行，避免误锁
+        for d in devices:
+            if d.get("uuid") == uuid:
+                if self._city_check and city and not self._city_known(rec, city):
+                    return "need_login", "ip_change"
+                return "accept", ""
+        if not devices:
+            return "accept", ""  # 首次设备：自动登记放行
+        platform_match = bool(platform) and any((d.get("platform") or "") == platform for d in devices)
+        city_ok = (not self._city_check) or (not city) or self._city_known(rec, city)
+        return "need_login", ("uuid_change" if (platform_match and city_ok) else "new_device")
 
     def _load(self):
         try:
@@ -222,6 +419,8 @@ class WhitelistStore:
             "email": email,
             "bind_time": int(time.time()),
             "uuid": "",
+            "devices": [],
+            "cities": [],
             "bind_openid": bind_openid or "",
             "frozen": False,
         }
@@ -260,14 +459,84 @@ class WhitelistStore:
         self._save()
         return True
 
-    def update_uuid(self, gid: str, player_name: str, new_uuid: str) -> bool:
-        """批准设备登录：把登记 UUID 更新为玩家当前设备。返回是否成功"""
-        rec = self.get_record(gid, player_name)
-        if rec is None or not new_uuid:
+    def rename(self, gid: str, old_name: str, new_name: str) -> tuple[bool, str]:
+        """修改白名单玩家名：记录整体搬到新名字下（邮箱/绑定人/绑定时间保留）。
+        登录记录清除（uuid 置空 + need_relogin），新名字须重新确认登录才能进服；
+        不涉及存档：游戏存档按原玩家名保存在 TShock 侧，本操作天然不迁移。"""
+        gid = gid or "nogroup"
+        group = self._data.get(gid, {})
+        old_rec = group.get(old_name)
+        if old_rec is None:
+            return False, "原玩家名不在白名单中"
+        if new_name in group:
+            return False, "新玩家名已被占用，请换一个名字"
+        rec = dict(old_rec)
+        rec["uuid"] = ""
+        rec.pop("devices", None)  # 新名字=全新身份：登记设备与常用城市全部重置
+        rec.pop("cities", None)
+        rec["need_relogin"] = True  # 阻止"首次进服自动登记放行"，强制走"登录"批准流程
+        rec.pop("last_join_time", None)
+        del group[old_name]
+        group[new_name] = rec
+        self._save()
+        return True, ""
+
+    def remove(self, gid: str, player_name: str) -> bool:
+        """移除一条白名单记录（邮箱改绑开始时作废原白名单用）。返回是否移除"""
+        group = self._data.get(gid or "nogroup", {})
+        if player_name not in group:
             return False
-        rec["uuid"] = new_uuid
+        del group[player_name]
         self._save()
         return True
+
+    def restore(self, gid: str, player_name: str, record: dict) -> bool:
+        """回滚恢复：把备份记录放回原玩家名（仅当该名字当前空缺）。返回是否恢复"""
+        group = self._data.setdefault(gid or "nogroup", {})
+        if player_name in group:
+            return False
+        group[player_name] = record
+        self._save()
+        return True
+
+    def approve_device(self, gid: str, player_name: str, new_uuid: str,
+                       platform: str = "", city: str = "") -> bool:
+        """批准设备登录：把当前设备加入该玩家的设备列表（多设备互不顶），
+        记入常用城市，并解除改名后的待重登标记。返回是否成功。
+        客户端未上报 UUID（部分 PC 端）时：跳过设备登记，仅解除重登标记并记城市。"""
+        rec = self.get_record(gid, player_name)
+        if rec is None:
+            return False
+        if new_uuid:
+            devices = self._devices(rec)
+            now = int(time.time())
+            for d in devices:
+                if d.get("uuid") == new_uuid:
+                    d["last_seen"] = now
+                    if platform:
+                        d["platform"] = platform
+                    break
+            else:
+                devices.append({"uuid": new_uuid, "platform": platform or "", "first_seen": now, "last_seen": now})
+            rec["uuid"] = new_uuid  # 兼容旧字段：保留最近一次批准的设备
+        self._city_touch(rec, city)
+        rec.pop("need_relogin", None)
+        self._save()
+        return True
+
+    def clear_devices(self, gid: str, player_name: str) -> int:
+        """清空该玩家已登录的全部设备（清 devices/uuid + 置 need_relogin 强制重新登录）。
+        常用城市保留（清设备≠换地区，重登时城市校验仍生效）。
+        返回清掉的设备数；记录不存在返回 -1。"""
+        rec = self.get_record(gid, player_name)
+        if rec is None:
+            return -1
+        cnt = len(self._devices(rec))
+        rec["devices"] = []
+        rec["uuid"] = ""
+        rec["need_relogin"] = True  # 阻止"首次进服自动登记放行"，强制走"登录"批准流程
+        self._save()
+        return cnt
 
     def freeze_by_openid(self, gid: str, openid: str) -> int:
         """用户退群：冻结其绑定人 openid 对应的全部白名单记录。返回冻结条数"""
@@ -301,81 +570,60 @@ class WhitelistStore:
         rec = self.get_record(gid, player_name)
         return bool(rec and rec.get("frozen"))
 
-    def check(self, gid: str, player_name: str, uuid: str = "") -> tuple[str, str]:
-        """进服判定：返回 (result, registered_uuid)。
+    def check(self, gid: str, player_name: str, uuid: str = "",
+              platform: str = "", city: str = "") -> tuple[str, str, str]:
+        """进服判定：返回 (result, registered_uuid, reason)。
         result: accept / need_login / not_in_whitelist / frozen
-        逻辑：已被冻结（退群自动冻结）→ frozen；
-              白名单内且（无登记uuid 或 uuid 一致）→ accept 并登记 uuid；
-              白名单内但 uuid 不一致 → need_login；不在白名单 → not_in_whitelist
+        reason: need_login 时给出原因（new_device 新设备 / uuid_change UUID变动 / ip_change IP跨市级变动）
         """
         gid = gid or "nogroup"
-        group = self._data.get(gid, {})
-        rec = group.get(player_name)
+        if self._changes is not None:
+            self._changes.sweep(self)  # 懒回滚：过期的邮箱改绑先恢复原白名单再判定
+        rec = self._data.get(gid, {}).get(player_name)
         if rec is None:
-            return "not_in_whitelist", ""
-        if rec.get("frozen"):
-            return "frozen", ""
-
-        registered = rec.get("uuid", "")
-        if registered == "":
-            # 首次进服：登记设备并放行，记录最后进服时间
+            return "not_in_whitelist", "", ""
+        result, reason = self._judge(rec, uuid, platform, city)
+        if result != "accept":
+            return result, "", reason
+        now = int(time.time())
+        devices = self._devices(rec)
+        hit = next((d for d in devices if d.get("uuid") == uuid), None) if uuid else None
+        if uuid and hit is None:
+            # 首次设备：自动登记并放行
+            devices.append({"uuid": uuid, "platform": platform or "", "first_seen": now, "last_seen": now})
             rec["uuid"] = uuid
-            rec["last_join_time"] = int(time.time())
-            self._save()
-            return "accept", uuid
-        if uuid != "" and registered != uuid:
-            return "need_login", registered
-        # 设备一致：放行并刷新最后进服时间
-        rec["last_join_time"] = int(time.time())
+        elif hit is not None:
+            hit["last_seen"] = now
+            if platform and not hit.get("platform"):
+                hit["platform"] = platform
+        self._city_touch(rec, city)
+        rec["last_join_time"] = now
         self._save()
-        return "accept", registered
+        return "accept", uuid or "", ""
 
-    def check_multi(self, owner_gid: str, shared_gids, player_name: str, uuid: str = ""):
-        """合并判定：owner_gid（权威）+ shared_gids 的白名单并集。
-        返回 (result, registered_uuid, hit_gid)
-        result: accept / need_login / not_in_whitelist / frozen
-        规则：
-          - 先查 owner_gid 群记录（权威）：命中则按与 check() 相同的逻辑判定
-            （frozen→frozen；registered==""→登记 uuid 并 accept；uuid 同→accept；uuid 异→need_login），hit_gid=owner_gid
-          - owner 群无记录：遍历 shared_gids 任一群命中：
-              * 该记录 frozen → frozen（并集内任一冻结即拒绝）
-              * registered==""：不登记（避免把 uuid 写到非权威群），返回 accept（放行但 hit_gid=命中群）
-              * uuid==registered → accept
-              * 否则 → need_login
-            hit_gid = 第一个命中记录所在群
-          - 全未命中 → (not_in_whitelist, "", "")
+    def check_multi(self, owner_gid: str, shared_gids, player_name: str,
+                    uuid: str = "", platform: str = "", city: str = ""):
+        """合并判定：owner_gid（权威）+ shared_gids 白名单并集。
+        返回 (result, registered_uuid, hit_gid, reason)
+        - owner 群命中：与 check() 完全一致（允许登记设备/写 LRU）
+        - 共享群命中：只读判定（不登记、不写 LRU），hit_gid=命中群
+        - 全未命中 → (not_in_whitelist, "", "", "")
         """
         owner_gid = owner_gid or "nogroup"
-        # ① owner 群（权威）：与 check() 判定逻辑一致，允许登记 uuid
-        group = self._data.get(owner_gid, {})
-        rec = group.get(player_name)
-        if rec is not None:
-            if rec.get("frozen"):
-                return "frozen", "", owner_gid
-            registered = rec.get("uuid", "")
-            if registered == "":
-                rec["uuid"] = uuid
-                self._save()
-                return "accept", uuid, owner_gid
-            if uuid != "" and registered != uuid:
-                return "need_login", registered, owner_gid
-            return "accept", registered, owner_gid
-        # ② owner 群无记录：遍历 shared_gids（共享群），只读判定，不登记 uuid
+        if self._changes is not None:
+            self._changes.sweep(self)
+        if self._data.get(owner_gid, {}).get(player_name) is not None:
+            result, registered, reason = self.check(owner_gid, player_name, uuid, platform, city)
+            return result, registered, owner_gid, reason
         for sgid in (shared_gids or []):
             if not sgid:
                 continue
             srec = self._data.get(sgid, {}).get(player_name)
             if srec is None:
                 continue
-            if srec.get("frozen"):
-                return "frozen", "", sgid
-            registered = srec.get("uuid", "")
-            if registered == "":
-                return "accept", "", sgid
-            if uuid != "" and registered != uuid:
-                return "need_login", registered, sgid
-            return "accept", registered, sgid
-        return "not_in_whitelist", "", ""
+            result, reason = self._judge(srec, uuid, platform, city)
+            return result, "", sgid, reason
+        return "not_in_whitelist", "", "", ""
 
     def is_bound(self, gid: str, player_name: str) -> bool:
         return player_name in self._data.get(gid or "nogroup", {})
@@ -383,8 +631,8 @@ class WhitelistStore:
 
 class PendingStore:
     """待批准的设备登录请求（换设备进服被判 need_login 时记录）：
-    {群openid: {玩家名: {uuid, ip, ts}}}
-    玩家在群里发"登录 玩家名"后由 BOT 校验并批准，更新白名单登记的 UUID。
+    {群openid: {玩家名: {uuid, ip, platform, city, reason, ts}}}
+    玩家在群里发"登录"后由 BOT 校验并批准（一步批准：立即生效并回执卡片）。
     """
 
     def __init__(self, path: str = PENDING_FILE):
@@ -405,13 +653,15 @@ class PendingStore:
         except OSError as e:
             print(f"[pending] 保存 pending.json 失败: {e}")
 
-    def record(self, gid: str, player_name: str, new_uuid: str, ip: str = ""):
-        """记录一次换设备进服：同玩家反复尝试时覆盖旧记录"""
+    def record(self, gid: str, player_name: str, new_uuid: str, ip: str = "",
+               platform: str = "", city: str = "", reason: str = ""):
+        """记录一次待批准登录：同玩家反复尝试时覆盖旧记录（reason: new_device/uuid_change/ip_change）"""
         gid = gid or "nogroup"
         if not new_uuid or not player_name:
             return
         self._data.setdefault(gid, {})[player_name] = {
-            "uuid": new_uuid, "ip": ip, "ts": int(time.time()),
+            "uuid": new_uuid, "ip": ip, "platform": platform, "city": city,
+            "reason": reason, "ts": int(time.time()),
         }
         self._save()
 
@@ -426,3 +676,105 @@ class PendingStore:
         if rec is not None:
             self._save()
         return rec
+
+
+class ChangeStore:
+    """白名单变更事务（改名限流 + 邮箱改绑）：
+      - 修改玩家名：成功后记录时间，48 小时内不得再次修改
+      - 邮箱改绑：开始时原白名单立即作废（备份旧记录）；24 小时内用新邮箱重新走
+        「绑定邮箱 → 添加白名单」才算改绑成功；超时未完成由 sweep 自动恢复原白名单；
+        每 7 天限一次（按发起时间计）
+    数据文件 whitelist_changes.json：
+      {
+        "changes": {openid: {gid, old_name, old_email, new_email, old_record, ts, deadline}},
+        "rate":    {openid: {"rename_ts": int, "email_ts": int}}
+      }
+    """
+
+    def __init__(self, path: str = CHANGES_FILE):
+        self.path = path
+        self._data = {"changes": {}, "rate": {}}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._data["changes"] = data.get("changes", {}) or {}
+            self._data["rate"] = data.get("rate", {}) or {}
+        except (OSError, json.JSONDecodeError):
+            self._data = {"changes": {}, "rate": {}}
+
+    def _save(self):
+        try:
+            atomic_write_json(self.path, self._data)
+        except OSError as e:
+            print(f"[whitelist] 保存 whitelist_changes.json 失败: {e}")
+
+    # ────────────── 限流 ──────────────
+    @staticmethod
+    def _left(ts, cooldown: int) -> int:
+        """距离限流结束还剩多少秒（0 = 已解除）"""
+        return max(0, int(cooldown - (time.time() - int(ts or 0))))
+
+    def rename_allowed(self, openid: str) -> tuple[bool, int]:
+        """修改玩家名限流检查。返回 (是否允许, 剩余秒)"""
+        ts = (self._data["rate"].get(openid or "") or {}).get("rename_ts", 0)
+        left = self._left(ts, RENAME_COOLDOWN)
+        return left <= 0, left
+
+    def email_allowed(self, openid: str) -> tuple[bool, int]:
+        """邮箱改绑限流检查。返回 (是否允许, 剩余秒)"""
+        ts = (self._data["rate"].get(openid or "") or {}).get("email_ts", 0)
+        left = self._left(ts, EMAIL_CHANGE_COOLDOWN)
+        return left <= 0, left
+
+    def mark_rename(self, openid: str):
+        """登记一次成功的改名（48 小时限流从现在起算）"""
+        self._data["rate"].setdefault(openid or "", {})["rename_ts"] = int(time.time())
+        self._save()
+
+    # ────────────── 邮箱改绑事务 ──────────────
+    def start_email_change(self, openid: str, gid: str, old_name: str,
+                           old_email: str, new_email: str, old_record: dict):
+        """开启改绑事务：备份旧记录（超时回滚用），并计入 7 天限流"""
+        now = int(time.time())
+        self._data["rate"].setdefault(openid or "", {})["email_ts"] = now
+        self._data["changes"][openid or ""] = {
+            "gid": gid, "old_name": old_name, "old_email": old_email,
+            "new_email": new_email, "old_record": old_record,
+            "ts": now, "deadline": now + EMAIL_CHANGE_TTL,
+        }
+        self._save()
+
+    def get_active(self, openid: str) -> dict | None:
+        """进行中的改绑事务（无则 None）"""
+        return self._data["changes"].get(openid or "")
+
+    def complete(self, openid: str) -> bool:
+        """改绑完成：移除事务条目（限流时间保留）。返回是否确实存在进行中事务"""
+        if self._data["changes"].pop(openid or "", None) is None:
+            return False
+        self._save()
+        return True
+
+    def sweep(self, whitelist_store: WhitelistStore) -> list:
+        """超时未完成的改绑：恢复原白名单记录并移除事务。
+        返回回滚列表 [(openid, 玩家名)]，供上层打日志。"""
+        now = time.time()
+        rolled = []
+        for openid, ch in list(self._data["changes"].items()):
+            if now <= ch.get("deadline", 0):
+                continue
+            gid = ch.get("gid") or "nogroup"
+            old_name = ch.get("old_name") or ""
+            old_rec = ch.get("old_record") or None
+            if old_name and old_rec:
+                if not whitelist_store.restore(gid, old_name, old_rec):
+                    # 回滚失败（名字已被占用等）：保留事务待下次 sweep 重试，直接 pop 会让原白名单永久丢失
+                    print(f"[whitelist] 邮箱改绑超时回滚暂失败（名字已被占用，保留事务待重试）: {old_name} @ {gid[:8]}…")
+                    continue
+                rolled.append((openid, old_name))
+            self._data["changes"].pop(openid, None)
+            self._save()
+        return rolled

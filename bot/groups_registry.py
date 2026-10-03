@@ -193,33 +193,34 @@ class GroupRegistry:
         self._save()
         return True, f"联合成功喵！本群为总群，目标群为第 {order} 个子群"
 
-    def unbind(self, gid: str) -> tuple:
-        """解除联合：
-          - 子群调用 → 自己脱离联合区（恢复独立）
-          - 总群调用 → 解散整个联合区（所有子群恢复独立）
+    def unbind(self, gid: str, target_gid: str | None = None) -> tuple:
+        """解除联合（按参数精确摘除）：
+          - 总群调用 → 仅摘除 target_gid 指定的子群（其余子群保持不变）；
+            target 必须填写且不能是总群自己
+          - 子群调用 → 自己脱离联合区（恢复独立）；target 只能填本群或总群
         返回 (ok, msg, affected_gids)。
         """
         ent = self._ent(gid)
         if ent is None:
             return False, "群不存在喵", []
         master = ent["master_gid"]
-        affected = []
         if not master:
-            # 总群：解散全部子群
-            for ogid, e in (self._data.get("groups", {}) or {}).items():
-                if (e or {}).get("master_gid") == gid:
-                    e["master_gid"] = None
-                    e["joined_at"] = 0
-                    e["join_order"] = 0
-                    affected.append(ogid)
-            if not affected:
-                return False, "本群没有子群喵", []
+            # 总群：精确摘除指定子群
+            if not target_gid or target_gid == gid:
+                return False, "请指定要摘除的子群ID（总群不能摘除自己喵）", []
+            target = self._ent(target_gid)
+            if target is None or (target.get("master_gid") or "") != gid:
+                return False, "目标群不是本联合区的子群喵", []
+            target["master_gid"] = None
+            target["joined_at"] = 0
+            target["join_order"] = 0
             self._save()
-            return True, f"已解散联合区，{len(affected)} 个子群恢复独立喵", affected
-        else:
-            # 子群：脱离
-            ent["master_gid"] = None
-            ent["joined_at"] = 0
-            ent["join_order"] = 0
-            self._save()
-            return True, "本群已解除联合，恢复独立喵", [gid]
+            return True, f"已摘除群ID {target.get('join_id')}，该子群恢复独立喵（其余子群保持不变）", [target_gid]
+        # 子群：脱离（只能解除本群自己；填总群ID同样视为本群脱离）
+        if target_gid and target_gid not in (gid, master):
+            return False, "子群只能解除本群自己喵（请填写本群或总群的群ID）", []
+        ent["master_gid"] = None
+        ent["joined_at"] = 0
+        ent["join_order"] = 0
+        self._save()
+        return True, "本群已解除联合，恢复独立喵", [gid]

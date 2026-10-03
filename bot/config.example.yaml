@@ -57,3 +57,16 @@ github:
   poll_interval_minutes: 1     # 检测新 Issue / PR / Star 的间隔（分钟）
   auto_push: true              # 检测到新动态是否主动推送图片到群（发"仓库/pr/issue"随时可查，不受此开关影响）
   token: ""                    # GitHub 细粒度令牌（Metadata: Read 即可）；不填则 star 用户名显示为"未知用户"
+
+# 种子投票（种子投票 / 投票 / 结束投票 / 重置）
+vote:
+  option_count: 6              # 随机生成的候选数量
+  update_interval_minutes: 60  # 票数卡更新间隔（分钟）
+  deadline_hours: 24           # 投票自动截止时长（小时）
+  bg_dir: ""                   # 投票卡背景图目录（留空 = 复用查背包素材目录）
+
+# 设备登录校验（新设备 / UUID 变动 / IP 跨市级变动）
+device_check:
+  enabled: true                 # 城市校验总开关：关闭后只按设备（UUID/平台）判定，不看 IP
+  ip2region_xdb: ""             # ip2region 离线库路径（留空 = bot 目录下的 ip2region.xdb）
+  city_max: 3                   # 每个白名单记录的常用城市上限（LRU：超出淘汰最久未用）
