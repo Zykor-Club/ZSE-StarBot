@@ -64,6 +64,10 @@ PERM_DEL_SERVER = "del_server"    # 删除服务器
 PERM_EXEC = "exec"                # 远程指令 / 远程执行
 PERM_ROLE_MANAGE = "role_manage"  # 设置/取消身份（任一高级管理员可用）
 PERM_BROADCAST = "broadcast"      # 公告广播（向联合区所有群发公告）
+PERM_VOTE_MANAGE = "vote_manage"  # 种子投票 / 结束投票
+PERM_VOTE_PUSH = "vote_push"      # 推送投票（向联合区所有群推卡）
+PERM_RESET = "reset"              # 重置（导出存档 → 触发重置 → 推送存档）
+PERM_PROGRESS_NOTIFY = "progress_notify"  # 进度提醒（设置/取消/列表）
 
 MIN_ROLE = {
     PERM_MAP_FETCH: MEMBER,        # member 直接通过，但群未开放时在 check 内拦截
@@ -74,6 +78,10 @@ MIN_ROLE = {
     PERM_EXEC: ADMIN,
     PERM_ROLE_MANAGE: OWNER,
     PERM_BROADCAST: MASTER,
+    PERM_VOTE_MANAGE: MASTER,
+    PERM_VOTE_PUSH: ADMIN,
+    PERM_RESET: MASTER,
+    PERM_PROGRESS_NOTIFY: ADMIN,
 }
 
 PERM_NEED_LABEL = {
@@ -85,6 +93,10 @@ PERM_NEED_LABEL = {
     PERM_EXEC: "管理员及以上",
     PERM_ROLE_MANAGE: "高级管理员",
     PERM_BROADCAST: "服主及以上",
+    PERM_VOTE_MANAGE: "服主及以上",
+    PERM_VOTE_PUSH: "管理员及以上",
+    PERM_RESET: "服主及以上",
+    PERM_PROGRESS_NOTIFY: "管理员及以上",
 }
 
 # 身份昵称 -> 身份 key（设置身份命令用）

@@ -9,12 +9,17 @@ deploy_config.json
 *.log
 pending.json
 whitelist.json
+votes.json
+verify.json
+whitelist_changes.json
+bindings.json
 starzsebot_fixed.json
 starzsebot_on.json
 
 # ===== 素材与打包产物（体积大，按 README 说明自行准备）=====
 assets/
 _lookbag_assets.zip
+_progress_assets.zip
 starZSEbot-plugin.zip
 github-bot-deploy.zip
 

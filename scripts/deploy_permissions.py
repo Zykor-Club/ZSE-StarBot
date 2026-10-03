@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""部署权限系统：bot 侧 5 个文件 + 插件 DLL，重启 TShock 与 QQBot
+"""部署 bot 代码 + 插件 DLL，重启 TShock 与 QQBot
 
 SSH 连接信息与插件输出目录读取自 deploy_config.json（不入库），见 deploy_config.example.json
 """
@@ -26,7 +26,15 @@ files = [
     (os.path.join(BOT_DIR, "whitelist_mail.py"), "C:/bot/whitelist_mail.py"),
     (os.path.join(BOT_DIR, "zse_server.py"), "C:/bot/zse_server.py"),
     (os.path.join(BOT_DIR, "main.py"), "C:/bot/main.py"),
+    (os.path.join(BOT_DIR, "groups_registry.py"), "C:/bot/groups_registry.py"),
     (os.path.join(BOT_DIR, "config.yaml"), "C:/bot/config.yaml"),
+    (os.path.join(BOT_DIR, "upload_media.py"), "C:/bot/upload_media.py"),
+    (os.path.join(BOT_DIR, "vote_store.py"), "C:/bot/vote_store.py"),
+    (os.path.join(BOT_DIR, "vote_render.py"), "C:/bot/vote_render.py"),
+    (os.path.join(BOT_DIR, "lookbag_render.py"), "C:/bot/lookbag_render.py"),
+    (os.path.join(BOT_DIR, "progress_render.py"), "C:/bot/progress_render.py"),
+    (os.path.join(BOT_DIR, "progress_notify_store.py"), "C:/bot/progress_notify_store.py"),
+    (os.path.join(BOT_DIR, "progress_unlock_store.py"), "C:/bot/progress_unlock_store.py"),
 ]
 
 # 插件 DLL（可选）：在 deploy_config.json 的 plugin_out_dir 中编译输出 starZSEbot.dll
