@@ -278,6 +278,9 @@ class PermissionManager:
         owners = g.setdefault("owners", [])
         if openid not in owners:
             return False, "该用户不是高级管理员"
+        # 不能取消自己：避免手滑把自己清掉（也避免"唯一管理员自撤 → 群回到无人可管状态"）
+        if operator and str(openid) == str(operator):
+            return False, "不能取消自己的高级管理员身份，请让其他高级管理员操作"
         if len(owners) <= 1:
             return False, "至少保留一名高级管理员，可先让其他高级管理员添加新成员后再取消"
         owners.remove(openid)

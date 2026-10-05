@@ -104,7 +104,7 @@ from seeds import Seeds
 from seed_render import render_seed_list_card
 from permissions import (
     PermissionManager,
-    OWNER, MASTER, ADMIN, MEMBER,
+    OWNER, MASTER, ADMIN, MEMBER, RANK,
     ROLE_ALIAS, PERM_NEED_LABEL, role_label,
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_EXEC,
     PERM_MAP_FETCH, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW, PERM_ROLE_MANAGE,
@@ -5289,6 +5289,29 @@ class GroupReviewClient(botpy.Client):
         if not (group_openid and member_openid and op in ("approve", "decline")):
             _log.warning("回调数据缺少必要字段: %s", data)
             await self._reply_interaction(interaction)
+            return
+
+        # 安全校验：审批卡片发在群里、按钮对全群可见 → 必须校验点击者身份（管理员及以上）。
+        # 否则任何群员点一下「批准」就能把任意申请人放进群（历史上这里确实漏了校验）。
+        clicker_openid = (getattr(interaction, "group_member_openid", None)
+                          or getattr(interaction, "user_openid", None) or "")
+        if self.perms.rank_of(self._eff_gid(group_openid), clicker_openid) < RANK[ADMIN]:
+            _log.warning("拒绝越权入群审批：group=%s clicker=%s",
+                         (group_openid or "")[:8], (clicker_openid or "")[:8])
+            try:
+                await self.api.post_group_message(
+                    group_openid=group_openid, msg_type=2,
+                    markdown=MarkdownPayload(content=self._insert_executor_at(
+                        f"{self.build_card_title('入群审批')}\n\n"
+                        "### ⚠️ 只有 **管理员及以上** 才能审批入群申请",
+                        clicker_openid)),
+                    event_id=getattr(interaction, "event_id", None))
+            except Exception as e:
+                _log.warning("越权提示发送失败: %s", e)
+            try:
+                await self._reply_interaction(interaction)
+            except Exception as e:
+                _log.warning("结束按钮交互失败: %s", e)
             return
 
         if op == "approve":

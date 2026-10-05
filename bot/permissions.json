@@ -1,0 +1,72 @@
+{
+  "G1": {
+    "owners": [
+      "A"
+    ],
+    "masters": [],
+    "admins": [],
+    "config": {
+      "allow_member_map": false,
+      "show_online_players": true,
+      "notify_server_status": true
+    },
+    "created_at": 1791197782,
+    "audit": [
+      {
+        "ts": 1791197782,
+        "who": "A",
+        "what": "设置高级管理员: + A"
+      },
+      {
+        "ts": 1791197782,
+        "who": "A",
+        "what": "添加 B 为高级管理员"
+      },
+      {
+        "ts": 1791197782,
+        "who": "A",
+        "what": "取消 B 的高级管理员"
+      },
+      {
+        "ts": 1791197782,
+        "who": "B",
+        "what": "设置 C 为 admin"
+      },
+      {
+        "ts": 1791197782,
+        "who": "B",
+        "what": "取消 C 的管理员"
+      }
+    ]
+  },
+  "G": {
+    "owners": [
+      "A"
+    ],
+    "masters": [],
+    "admins": [],
+    "config": {
+      "allow_member_map": false,
+      "show_online_players": true,
+      "notify_server_status": true
+    },
+    "created_at": 1791197791,
+    "audit": [
+      {
+        "ts": 1791197791,
+        "who": "A",
+        "what": "设置高级管理员: + A"
+      },
+      {
+        "ts": 1791197791,
+        "who": "A",
+        "what": "添加 B 为高级管理员"
+      },
+      {
+        "ts": 1791197791,
+        "who": "A",
+        "what": "取消 B 的高级管理员"
+      }
+    ]
+  }
+}
