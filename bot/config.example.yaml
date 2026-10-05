@@ -30,6 +30,7 @@ apply_title: "ZSE联合体"
 # starZSEbot 服务端（TShock 插件连接本机器人的端口）
 # 有 NAT 映射时：插件侧 ServerUrl 填「公网IP:公网映射端口」
 zse_server_port: 13140
+zse_tls_dir: ""                # 插件通道 TLS：指向含 fullchain.pem + privkey.pem 的目录则启用 wss（公网部署建议开启；留空=明文 ws）
 
 # 机器人对外称呼（邮件正文/提示里用到）
 bot_name: "猫娘小梦"

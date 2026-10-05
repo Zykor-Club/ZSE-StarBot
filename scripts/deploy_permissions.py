@@ -30,11 +30,22 @@ files = [
     (os.path.join(BOT_DIR, "config.yaml"), "C:/bot/config.yaml"),
     (os.path.join(BOT_DIR, "upload_media.py"), "C:/bot/upload_media.py"),
     (os.path.join(BOT_DIR, "vote_store.py"), "C:/bot/vote_store.py"),
+    (os.path.join(BOT_DIR, "server_status_store.py"), "C:/bot/server_status_store.py"),
     (os.path.join(BOT_DIR, "vote_render.py"), "C:/bot/vote_render.py"),
     (os.path.join(BOT_DIR, "lookbag_render.py"), "C:/bot/lookbag_render.py"),
     (os.path.join(BOT_DIR, "progress_render.py"), "C:/bot/progress_render.py"),
     (os.path.join(BOT_DIR, "progress_notify_store.py"), "C:/bot/progress_notify_store.py"),
     (os.path.join(BOT_DIR, "progress_unlock_store.py"), "C:/bot/progress_unlock_store.py"),
+    (os.path.join(BOT_DIR, "help_content.py"), "C:/bot/help_content.py"),
+    (os.path.join(BOT_DIR, "rank_render.py"), "C:/bot/rank_render.py"),
+    # 2026-10-05：补齐 github_monitor.py / card_render.py（AGENT.md §7.7 的清单缺口已修复），
+    # 并新增图鉴模块
+    (os.path.join(BOT_DIR, "lexicon.py"), "C:/bot/lexicon.py"),
+    (os.path.join(BOT_DIR, "lexicon_render.py"), "C:/bot/lexicon_render.py"),
+    (os.path.join(BOT_DIR, "seeds.py"), "C:/bot/seeds.py"),
+    (os.path.join(BOT_DIR, "seed_render.py"), "C:/bot/seed_render.py"),
+    (os.path.join(BOT_DIR, "github_monitor.py"), "C:/bot/github_monitor.py"),
+    (os.path.join(BOT_DIR, "card_render.py"), "C:/bot/card_render.py"),
 ]
 
 # 插件 DLL（可选）：在 deploy_config.json 的 plugin_out_dir 中编译输出 starZSEbot.dll

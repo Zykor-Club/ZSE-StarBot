@@ -438,7 +438,8 @@ def render_lookbag_image(payload: dict, server_name: str = "", querier: str = ""
 
     import io
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, "PNG", optimize=True)
+    # JPEG 比 PNG 小 4 倍以上，群里上传更快（卡片是不透明合成图，无透明通道需求）
+    img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True, progressive=True)
     return buf.getvalue()
 
 

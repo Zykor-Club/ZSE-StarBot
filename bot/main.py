@@ -38,17 +38,79 @@ from botpy.types.message import MarkdownPayload, KeyboardPayload
 
 import github_monitor
 from card_render import render_card
-from zse_server import ZseServer, decode_map_png, decode_archive_zip
-from whitelist_mail import ChangeStore, MailSender, PendingStore, VerifyManager, WhitelistStore, check_name_ok
+from zse_server import (ZseServer, decode_map_png, decode_archive_zip, decode_compressed_b64,
+                        make_ssl_context)
+
+RANK_PAGE_SIZE = 10   # 排行卡每页条数（图片与翻页按钮共用，必须一致）
+LEX_LIMIT = 12               # 图鉴搜索结果一次展示条数
+VOTE_MAX_OPTIONS = 6         # 投票卡固定 6 项（满员后新提案顶掉最旧的一条）
+VOTE_RANDOM_OPTIONS = 3      # /种子投票 只随机 3 条，其余 3 个位置留给玩家提案
+VOTE_PROPOSALS_PER_USER = 2  # 每人同时最多在场提案数
+_LEX_CMDS: list = []         # 懒初始化：本常量区在 import lexicon 之前，不能在此直接引用模块
+
+
+def _lexicon_match(raw):
+    """识别图鉴子指令（si/sn/sp/sb/sx 与中文别名），返回命中的指令词，未命中返回 None。
+
+    2 字母指令必须跟分隔符（空格/全角空格/冒号），避免把 sin 这类普通单词误判成 si。
+    """
+    if not _LEX_CMDS:
+        _LEX_CMDS.extend(sorted(lexicon.COMMANDS.keys(), key=len, reverse=True))
+    low = str(raw or "").lower()
+    for cmd in _LEX_CMDS:
+        c = cmd.lower()
+        if not low.startswith(c):
+            continue
+        if c.isascii():
+            nxt = low[len(c):len(c) + 1]
+            if low == c or nxt in (" ", "　", ":", "："):
+                return cmd
+        else:
+            return cmd
+    return None
+
+
+_PING_LAST: dict = {}        # (host, port) -> 上次 ping 时间戳（5 分钟冷却）
+_PING_COOLDOWN = 300
+
+
+def _md_fence_safe(value) -> str:
+    """代码围栏（```）内文本：只处理能打破围栏的反引号，**保留换行与原字符**
+    （远程指令输出是多行的，不能像卡片正文那样压平/替换尖括号）"""
+    s = str(value or "")
+    return s.replace("```", "'''").replace("`", "'")
+
+
+def _md_safe(value) -> str:
+    """外部字符串进 markdown 卡片前转义：防止注入 <qqbot-at-user> 等标签或破坏排版。
+
+    覆盖来源：插件列表的作者/描述（第三方插件元数据）、服务器自报名、世界名、
+    排行榜标题、远程指令输出等——这些都不是我们可控的文本。
+    """
+    s = str(value or "")
+    for ch, rep in (("<", "["), (">", "]"), ("`", "'"), ("\n", " "), ("\r", " ")):
+        s = s.replace(ch, rep)
+    return s
+from whitelist_mail import (ChangeStore, MailSender, PendingStore, VerifyManager, WhitelistStore,
+                            check_name_ok, check_qq_email)
 from groups_registry import GroupRegistry
+import help_content
+from rank_render import render_rank_card
+import lexicon
+from lexicon import Lexicon
+from lexicon_render import render_lexicon_card
+from server_status_store import ServerStatusStore
+from seeds import Seeds
+from seed_render import render_seed_list_card
 from permissions import (
     PermissionManager,
     OWNER, MASTER, ADMIN, MEMBER,
     ROLE_ALIAS, PERM_NEED_LABEL, role_label,
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_EXEC,
     PERM_MAP_FETCH, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW, PERM_ROLE_MANAGE,
-    PERM_BROADCAST, PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET,
-    PERM_PROGRESS_NOTIFY,
+    PERM_BROADCAST, PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET, PERM_VOTE_PROPOSAL_DEL,
+PERM_BACKUP,
+    PERM_PROGRESS_NOTIFY, PERM_SAY_ALL, PERM_STATUS_NOTIFY, 
 )
 from github_monitor import (
     get_repo_stats, get_latest_pulls, get_latest_issues, get_org_repos, get_repo_stargazers,
@@ -174,7 +236,21 @@ class GroupReviewClient(botpy.Client):
         # starZSEbot 服务端（TShock 插件长连接）
         _cfg = load_config()
         self.zse_port = int(_cfg.get("zse_server_port", 13140))
+        # 插件通道 TLS：指向含 fullchain.pem + privkey.pem 的目录则启用 wss，留空=明文 ws
+        self.zse_tls_dir = (cfg.get("zse_tls_dir") or "").strip()
         self.whitelist_store = WhitelistStore()
+        self.lexicon_store = Lexicon()
+        self.seeds = Seeds()
+        self.status_store = ServerStatusStore()
+        # 投票结果卡发布锁：结束投票指令与 60 秒调度可能同时想发布同一场投票，
+        # 不加锁会出现"结果卡发两轮"（每个群多一张卡）
+        self._vote_pub_lock = asyncio.Lock()
+        # 指令去重：开启「接收所有消息」后，一条 @ 指令可能同时从
+        # on_group_at_message_create 与 on_group_message_create 两个事件到达 → 必须只处理一次
+        # （普通指令的第二次回复会被 QQ 判重挡掉，但主动消息类指令会对所有群多发一轮）
+        self._handled_msgs = {}
+        # 首杀播报幂等表：同一场首杀只播报一次（插件重发/WS 重连重放时不再多播一轮）
+        self._notify_fired = {}
         # 设备登录校验配置（IP 跨市级变动；离线库缺失/解析失败自动跳过城市校验）
         dev_cfg = _cfg.get("device_check", {}) or {}
         self.whitelist_store.configure_device_check(
@@ -329,9 +405,18 @@ class GroupReviewClient(botpy.Client):
         from aiohttp import web
         runner = web.AppRunner(self.zse_server.build_app())
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.zse_port)
+        ctx = None
+        tls_dir = getattr(self, "zse_tls_dir", "") or ""
+        if tls_dir:
+            cert = os.path.join(tls_dir, "fullchain.pem")
+            key = os.path.join(tls_dir, "privkey.pem")
+            if os.path.exists(cert) and os.path.exists(key):
+                ctx = make_ssl_context(cert, key)
+            else:
+                _log.warning("配置了 zse_tls_dir 但缺少 fullchain.pem/privkey.pem，本次仍以明文 ws 提供：%s", tls_dir)
+        site = web.TCPSite(runner, "0.0.0.0", self.zse_port, ssl_context=ctx)
         await site.start()
-        _log.info("starZSEbot 服务端已监听 %s 端口（TShock 插件连接用）", self.zse_port)
+        _log.info("starZSEbot 服务端已监听 %s 端口（%s）", self.zse_port, "wss/TLS" if ctx else "ws 明文")
 
     async def on_group_add_robot(self, event: GroupManageEvent):
         """机器人被拉进群：自动加入轮询列表（方便获取 group_openid）。
@@ -344,11 +429,21 @@ class GroupReviewClient(botpy.Client):
             self.groups[f"群({gid[:8]}...)"] = gid
             _log.warning("已将 %s 加入轮询列表（这个 openid 建议复制到 config.yaml 固化）", gid)
         op = getattr(event, "op_member_openid", None) or ""
-        # 身份归总群：若该群是联合子群，写入总群（_eff_gid）；独立/总群时即 gid 自身
-        eff = self._eff_gid(gid)
-        if op and not self.perms.is_owner(eff, op):
-            self.perms.set_first_owner(eff, op, who=op, note="机器人被拉入群，自动设为高级管理员")
-            _log.info("已将添加机器人的用户设为群 %s 的高级管理员", eff)
+        self.registry.get_or_assign(gid)
+        if self.registry.consume_kicked(gid):
+            # 该群被移出过机器人 → 数据作废重建（对齐 CaiBotLite event/add_robot.py：
+            # 重新拉入时 admins 只留拉入者、parent_open_id 置空；我们额外清空该群服务器绑定）
+            unlinked = self.registry.unlink(gid)
+            self.perms.reset_group(gid, op)
+            n_srv = await self.zse_server.unregister_all(gid)
+            _log.warning("机器人被重新拉入群 %s：身份已重置（拉入者 %s…）、解除联合 %d 个群、清空服务器 %d 台",
+                         gid[:8], (op or "")[:8], len(unlinked), n_srv)
+        else:
+            # 首次加入：身份归总群（_eff_gid）；独立/总群时即 gid 自身
+            eff = self._eff_gid(gid)
+            if op and not self.perms.is_owner(eff, op):
+                self.perms.set_first_owner(eff, op, who=op, note="机器人被拉入群，自动设为高级管理员")
+                _log.info("已将添加机器人的用户设为群 %s 的高级管理员", eff)
         try:
             # 以"事件被动回复"发送引导卡（event_id），不依赖群主开启主动发言权限（CaiBotLite 同款做法）
             await self._send_add_robot_guide(
@@ -432,6 +527,11 @@ class GroupReviewClient(botpy.Client):
 
     async def on_group_del_robot(self, event: GroupManageEvent):
         _log.info("机器人被移出群聊 group_openid=%s", event.group_openid)
+        # 打标记：重新拉入时按「数据作废重建」处理（语义对齐 CaiBotLite event/add_robot.py）
+        try:
+            self.registry.mark_kicked(event.group_openid)
+        except Exception as e:
+            _log.warning("记录被移出标记失败: %s", e)
 
     async def on_group_at_message_create(self, message):
         """群里 @机器人 的消息事件（未开全量接收时触发）：自动接入 + 指令分发"""
@@ -491,6 +591,17 @@ class GroupReviewClient(botpy.Client):
 
     async def _dispatch_command(self, message, is_at_event: bool = False):
         """指令分发：TShock 服务器管理（starZSEbot 协议）+ 权限管理 + GitHub"""
+        # 同一条消息可能被"@事件"和"全量消息事件"各推一次 → 按消息 id 去重
+        mid = getattr(message, "id", None) or ""
+        if mid:
+            now = time.time()
+            if mid in self._handled_msgs:
+                _log.info("忽略重复分发的同一条消息: %s…", str(mid)[:8])
+                return
+            self._handled_msgs[mid] = now
+            if len(self._handled_msgs) > 256:      # 只保留最近 5 分钟，防止无限增长
+                for k in [k for k, t in self._handled_msgs.items() if now - t > 300]:
+                    self._handled_msgs.pop(k, None)
         raw = (message.content or "").strip()
         # @ 的是别人（含其它机器人）而非本机器人 → 不回应（仅事件级 @ 我们、或纯指令才回应）
         if not is_at_event and self._at_targets_other(message):
@@ -523,16 +634,8 @@ class GroupReviewClient(botpy.Client):
         if low in ("群信息", "群资料"):  # 群信息：任何群员可查
             await self.cmd_group_info(message, gid)
             return
-        if low in ("帮助", "help"):  # 帮助：与卡片"帮助"按钮同一内容
-            await self._reply_markdown(
-                message,
-                "\n".join([
-                    self.build_card_title("帮助"),
-                    "发送关键词获取对应功能喵!",
-                    "---",
-                    "> 入群申请审核 / 退群通知 / 更多能力敬请期待",
-                ]),
-            )
+        if low.startswith(("帮助", "help")):  # 帮助 [分类]：帮助卡片（带分类按钮）/ 该分类指令清单
+            await self.cmd_help(message, text, gid, user_openid)
             return
         if low in ("关于", "about"):  # 关于：机器人信息（任何群员可查，/关于 亦可）
             await self.cmd_about(message, gid, user_openid)
@@ -547,6 +650,11 @@ class GroupReviewClient(botpy.Client):
             if not await self._perm_ok(message, gid, user_openid, PERM_MAP_TOGGLE, "允许成员获取地图"):
                 return
             await self.cmd_map_toggle(message, text, gid, user_openid)
+            return
+        if low.startswith("服务器通知"):  # 服务器通知 [开|关]（admin 及以上）
+            if not await self._perm_ok(message, gid, user_openid, PERM_STATUS_NOTIFY, "服务器通知"):
+                return
+            await self.cmd_server_status_notify(message, text, gid, user_openid)
             return
         if low.startswith("允许查看在线玩家"):  # 允许查看在线玩家 [开|关]（admin 及以上）
             if not await self._perm_ok(message, gid, user_openid, PERM_ONLINE_SHOW, "允许查看在线玩家"):
@@ -591,12 +699,47 @@ class GroupReviewClient(botpy.Client):
             # 查背包 <服务器序号> [玩家名]：任何人可查（宽松，与 CaiBotLite 一致）
             await self.cmd_lookbag(message, text, gid, user_openid)
             return
+        if low.startswith(("自踢", "自提", "自体")):  # 自踢：断开自己（所有人可用，需已绑定白名单）
+            await self.cmd_self_kick(message, text, gid, user_openid)
+            return
+        if low.startswith("插件列表"):  # 插件列表 <序号>：该服务器已加载的插件
+            await self.cmd_plugin_list(message, text, gid, user_openid)
+            return
+        if low.startswith("排行"):  # 排行 <序号> <项目> [参数] [页码]（所有人可用）
+            await self.cmd_rank(message, text, gid, user_openid)
+            return
+        _lex = _lexicon_match(low)
+        if _lex:  # 图鉴搜索：si/sn/sp/sb/sx（搜物品/搜生物/搜弹幕/搜增益/搜修饰）
+            await self.cmd_lexicon(message, text, lexicon.COMMANDS[_lex], gid)
+            return
+        if low.startswith(("下载小地图文件", "下载小地图")):  # 下载小地图 <序号>：.map 文件
+            if not self.perms.check(self._eff_gid(gid), user_openid, PERM_MAP_FETCH):
+                await self._reply_markdown(message, "\n".join([
+                    self.build_card_title("下载小地图"), "",
+                    "**❌ 群内未开放普通成员获取地图喵**", "",
+                    "> 可由 管理员及以上 发送 `允许成员获取地图 开` 开放",
+                ]))
+                return
+            await self.cmd_download_map(message, text, gid)
+            return
+        if low.startswith(("下载地图", "下载世界文件", "下载存档")):  # 下载地图 <序号>：.wld 世界存档
+            if not self.perms.check(self._eff_gid(gid), user_openid, PERM_MAP_FETCH):
+                await self._reply_markdown(message, "\n".join([
+                    self.build_card_title("下载地图"), "",
+                    "**❌ 群内未开放普通成员获取地图喵**", "",
+                    "> 可由 管理员及以上 发送 `允许成员获取地图 开` 开放",
+                ]))
+                return
+            await self.cmd_download_world(message, text, gid)
+            return
         if low.startswith(("远程指令", "远程执行")):  # 远程指令 <序号|all|*> <指令>
             if not await self._perm_ok(message, gid, user_openid, PERM_EXEC, "远程指令"):
                 return
             await self.cmd_exec(message, text, gid)
             return
-        if low.startswith("全服喊话"):  # 全服喊话 <内容>：对所有服务器广播
+        if low.startswith("全服喊话"):  # 全服喊话 <内容>：对所有在线服务器广播（管理员及以上）
+            if not await self._perm_ok(message, gid, user_openid, PERM_SAY_ALL, "全服喊话"):
+                return
             await self.cmd_say_all(message, text, gid)
             return
         if low.startswith("广播"):  # 广播 <内容>：向联合区所有群发公告（服主+）
@@ -611,6 +754,25 @@ class GroupReviewClient(botpy.Client):
         # ── 种子投票 / 投票 / 结束投票 / 重置（AutoResetPlus 接入，见 spec add-seed-vote-reset）──
         # 分发顺序证据：「种子投票」「结束投票」先于「投票」判断；且二者均不以"投票"开头，
         # startswith("投票") 不会把「种子投票」「结束投票」误落到「投票」处理器。
+        if low.startswith("备份") and not low.startswith("备份状态"):  # 备份 [发送] <序号>（管理员及以上）
+            if not await self._perm_ok(message, gid, user_openid, PERM_BACKUP, "备份"):
+                return
+            await self.cmd_backup(message, text, gid)
+            return
+        if low.startswith("种子列表"):  # 种子列表 [页码]（所有人可用）
+            await self.cmd_seed_list(message, text, gid)
+            return
+        if low.startswith("种子提案"):  # 种子提案 <服务器序号> <序号+序号…>（所有人可用）
+            await self.cmd_seed_propose(message, text, gid, user_openid)
+            return
+        if low.startswith("撤回提案"):  # 撤回提案 <服务器序号> <编号>（提案人本人）
+            await self.cmd_seed_withdraw(message, text, gid, user_openid)
+            return
+        if low.startswith("删除提案"):  # 删除提案 <服务器序号> <编号>（管理员及以上）
+            if not await self._perm_ok(message, gid, user_openid, PERM_VOTE_PROPOSAL_DEL, "删除提案"):
+                return
+            await self.cmd_seed_delete(message, text, gid, user_openid)
+            return
         if low.startswith("种子投票"):  # 种子投票 [序号] [候选…]（服主及以上）
             if not await self._perm_ok(message, gid, user_openid, PERM_VOTE_MANAGE, "种子投票"):
                 return
@@ -903,21 +1065,119 @@ class GroupReviewClient(botpy.Client):
             f"> 用户id:{user_openid or '未知'}",
         ])
 
+    # ───────────────────────── 帮助指令（分类卡片 + 分类按钮） ─────────────────────────
+    def _help_rank(self, gid, user_openid: str) -> int:
+        """当前用户在（联合区有效群）中的身份等级"""
+        return self.perms.rank_of(self._eff_gid(gid), user_openid or "")
+
+    def _help_index_card(self, gid, user_openid: str) -> str:
+        return help_content.render_index(self._help_rank(gid, user_openid), self.build_card_title)
+
+    def _help_category_card(self, key: str, gid, user_openid: str) -> str:
+        return help_content.render_category(key, self._help_rank(gid, user_openid), self.build_card_title)
+
+    @staticmethod
+    def _help_keyboard(rank: int = None) -> KeyboardPayload:
+        """分类按钮：type=2「指令按钮」，点击即发送 `帮助 <分类>`（无需回调处理，对齐 CaiBotLite）
+        传 rank 时隐藏该身份整类都无权限的分类按钮"""
+        rows = []
+        for cats in help_content.keyboard_layout(rank):
+            rows.append(KeyboardRow(buttons=[
+                Button(
+                    id=f"help_{c['key']}",
+                    render_data=RenderData(label=f"{c['emoji']} {c['title']}", style=1),
+                    action=Action(
+                        type=2,
+                        permission=Permission(type=2),
+                        data=f"帮助 {c['title']}",
+                    ),
+                )
+                for c in cats
+            ]))
+        return KeyboardPayload(content=Keyboard(rows=rows))
+
+    async def _reply_markdown_kb(self, message, content: str, keyboard=None):
+        """Markdown（可带键盘）发送；失败降级纯文本（命令标签转纯命令）"""
+        uid = self._user_openid(message)
+        content = self._insert_executor_at(content, uid)
+        kwargs = {
+            "group_openid": message.group_openid, "msg_type": 2,
+            "msg_id": message.id,
+            "markdown": MarkdownPayload(content=content),
+        }
+        if keyboard:
+            kwargs["keyboard"] = keyboard
+        try:
+            await self.api.post_group_message(**kwargs)
+        except Exception as e:
+            _log.warning("卡片(带键盘)发送失败，降级纯文本: %s", e)
+            at_tag = f'<qqbot-at-user id="{uid}" />' if uid else ""
+            await self._reply_text(message, self._markdown_to_plain(
+                content, at_tag, f"@{self._disp(message.group_openid, uid)}" if uid else ""))
+
+    async def _reply_help(self, message, content: str, with_keyboard: bool = True, rank: int = None):
+        """帮助卡片发送；with_keyboard=False 时只发 markdown（分类卡不带切换按钮）"""
+        await self._reply_markdown_kb(
+            message, content, self._help_keyboard(rank) if with_keyboard else None)
+
+    async def cmd_help(self, message, text: str, gid, user_openid: str = ""):
+        """帮助 [分类]：无参数=帮助卡片（带分类按钮）；带分类=该分类指令清单"""
+        parts = (text or "").split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        rank = self._help_rank(gid, user_openid)
+        if not arg:
+            await self._reply_help(message, self._help_index_card(gid, user_openid),
+                                   rank=rank)
+            return
+        cat = help_content.find_category(arg)
+        if cat is None:
+            await self._reply_help(
+                message,
+                "\n".join([
+                    self.build_card_title("帮助"),
+                    "",
+                    f"### ⚠️ 没有找到分类「{arg}」喵",
+                    "可用分类：" + "、".join(
+                        f"{c['emoji']}{c['title']}" for c in help_content.CATEGORIES),
+                ]),
+                rank=rank,
+            )
+            return
+        # 分类卡不带分类切换按钮（只有主卡带）
+        await self._reply_help(message, self._help_category_card(cat["key"], gid, user_openid),
+                               with_keyboard=False)
+
     # ───────────────────────── GitHub 消息推送 ─────────────────────────
     async def github_poll(self):
         """定时检测仓库新 Issue / PR，发现新动态主动推送到所有监控群"""
-        interval = int(self.github_cfg.get("poll_interval_minutes", 10)) * 60
+        interval = int(self.github_cfg.get("poll_interval_minutes", 10) or 10) * 60
         _log.info("GitHub 轮询启动，间隔 %s 分钟", interval // 60)
-        # 先跑一次建立基线（不推送），再进入循环；首跑失败不能让整个轮询任务退出
+        fails = 0
+        # 先跑一次建立基线（不推送），再进入循环；首跑失败不能让整个轮询任务退出。
+        # 网络类失败（GitHub 从服务器常不可达）只记一行并指数退避，不打整页堆栈刷屏。
         try:
             await self.check_github(push_initial=False)
+        except (asyncio.TimeoutError, OSError) as e:
+            fails = 1
+            _log.warning("GitHub 查询失败（首次，%s）：%s", type(e).__name__, e)
         except Exception as e:
+            fails = 1
             _log.exception("GitHub 轮询首跑失败（后续按周期重试）: %s", e)
         while True:
-            await asyncio.sleep(interval)
+            delay = interval if not fails else min(interval * (2 ** min(fails, 3)), interval * 8)
+            await asyncio.sleep(delay)
             try:
                 await self.check_github(push_initial=True)
+                if fails:
+                    _log.info("GitHub 轮询已恢复正常")
+                fails = 0
+            except (asyncio.TimeoutError, OSError) as e:
+                fails += 1
+                back = min(interval * (2 ** min(fails, 3)), interval * 8)
+                _log.warning("GitHub 查询失败（连续 %d 次，%s），%d 秒后重试：%s",
+                             fails, type(e).__name__, back, e)
             except Exception as e:
+                fails += 1
                 _log.exception("GitHub 轮询出错: %s", e)
 
     async def check_github(self, push_initial: bool = True):
@@ -1134,9 +1394,13 @@ class GroupReviewClient(botpy.Client):
 
     @staticmethod
     def _markdown_to_plain(content: str, at_tag: str = "", at_text: str = "") -> str:
-        """Markdown → 纯文本降级：去掉行首标题标记（#/##/###）、图片语法、反引号与粗体，at 标签转为 @ 文本"""
+        """Markdown → 纯文本降级：去掉行首标题标记（#/##/###）、图片语法、反引号与粗体；
+        at 标签转为 @ 文本；命令标签（qqbot-cmd-input / cmd-enter）转为纯命令文本"""
         plain = re.sub(r"^#{1,6} ", "", content, flags=re.M)
         plain = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", plain)
+        plain = re.sub(r"<qqbot-cmd-input\b[^>]*/>",
+                       lambda m: (re.search(r'text="([^"]*)"', m.group(0)) or [None, ""])[1], plain)
+        plain = re.sub(r"<qqbot-cmd-enter\b[^>]*/>", "", plain)
         plain = plain.replace("`", "").replace("**", "")
         if at_tag:
             plain = plain.replace(at_tag, at_text or "")
@@ -1399,6 +1663,17 @@ class GroupReviewClient(botpy.Client):
             return
         host = parts[1]
         port = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 7777
+        # 冷却：同一 ip:port 5 分钟内只测一次（防被当成内网端口扫描器刷）
+        now = time.time()
+        last = _PING_LAST.get((host, port))
+        if last and now - last < _PING_COOLDOWN:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title("Ping服务器"), "",
+                f"**⏳ 这个地址刚测过喵...**",
+                f"> 请 {int(_PING_COOLDOWN - (now - last))} 秒后再试",
+            ]))
+            return
+        _PING_LAST[(host, port)] = now
         ok, ms = await self.zse_server.ping(host, port)
         if ok:
             await self._reply_markdown(
@@ -1600,6 +1875,315 @@ class GroupReviewClient(botpy.Client):
             summary = "**❌ 背包图渲染失败，文字降级也不可用喵...**"
         await self._reply_markdown(message, "## ꧁༺ 查询背包 ༻꧂\n\n" + summary)
 
+    # ───────────────────────── 自踢 / 插件列表 / 排行 / 下载文件 ─────────────────────────
+    def _self_player_name(self, gid, user_openid: str) -> str:
+        """按 openid 反查白名单玩家名（与「喊话」同一套解析）"""
+        eff = self._eff_gid(gid)
+        return (self.whitelist_store.find_by_openid(eff, user_openid)
+                or self.whitelist_store.claim_single(eff, user_openid) or "")
+
+    async def cmd_self_kick(self, message, text: str, gid, user_openid: str = ""):
+        """自踢：把白名单绑定的角色名断开发到联合区内所有在线服务器（所有人可用）"""
+        gid = gid or (getattr(message, "group_openid", None) or "")
+        name = self._self_player_name(gid, user_openid)
+        if not name:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title("自踢"), "",
+                "**❌ 您还未绑定白名单，无法自踢喵...**", "",
+                "> 先发 `绑定邮箱 <邮箱>` 按提示添加白名单",
+            ]))
+            return
+        sent = await self.zse_server.send_self_kick(gid, name)
+        await self._reply_at_then_card(message, user_openid, "\n".join([
+            self.build_card_title("自踢"), "",
+            f"### ✅ 已请求断开 `{name}` 的连接",
+            f"> 已发送到 **{sent}** 个在线服务器｜仅当角色在线时才会被踢出",
+        ]))
+
+    @staticmethod
+    def _plugin_rows(plugins) -> list:
+        """插件列表 -> 展示行（`- 名称 | 作者 | 描述 | v版本`），按名称排序。
+
+        插件回包字段是 PascalCase（C# PluginInfo 的字段名），这里兼容小写写法。
+        """
+        def field(p, key):
+            return _md_safe(p.get(key) or p.get(key.lower()) or "")
+
+        return [
+            f"- {field(p, 'Name')} | {field(p, 'Author')} | {field(p, 'Description')} | v{field(p, 'Version')}"
+            for p in sorted(plugins or [], key=lambda p: field(p, "Name").lower())
+        ]
+
+    async def cmd_plugin_list(self, message, text: str, gid, user_openid: str = ""):
+        """插件列表 <序号>：列出该服务器已加载的插件（名称 | 作者 | 描述 | 版本）"""
+        gid = gid or (getattr(message, "group_openid", None) or "")
+        rest = text[len("插件列表"):].lstrip("：: \t").strip()
+        toks = rest.split(None, 1)
+        if not toks or not toks[0].isdigit():
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title("插件列表"), "",
+                "**❌ 参数不完整喵...**", "", "格式：`插件列表 <服务器序号>`",
+            ]))
+            return
+        seq = int(toks[0])
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title("插件列表"), "",
+                f"**❌ 找不到序号 {seq} 的服务器喵...**",
+            ]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title("插件列表"), "", "**❌ 该服务器标识无效喵...**",
+            ]))
+            return
+        ok, data = await self.zse_server.request_plugin_list(server_code, timeout=15)
+        if not ok or not isinstance(data, dict):
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title("插件列表"), "",
+                "**❌ 插件列表获取失败喵...**", f"> 原因：{self._reason_of(data)}",
+            ]))
+            return
+        plugins = data.get("plugins") or []
+        rows = self._plugin_rows(plugins)
+        kind = "MOD" if data.get("is_mod") else "插件"
+        sname = rec.get("server_name") or f"服务器 {seq}"
+        await self._reply_markdown(message, "\n".join([
+            self.build_card_title(f"{kind}列表"), "",
+            f"### 💾 {sname}｜共 {len(plugins)} 个{kind}",
+            "",
+            "\n".join(rows) if rows else "> 该服务器没有加载任何插件",
+        ]))
+
+    @staticmethod
+    def _rank_table(rank_lines: dict, page: int, page_size: int = 10):
+        """排行榜 -> markdown 表格；返回 (表格, 当前页, 总页数)"""
+        items = list(rank_lines.items())
+        total_pages = max(1, (len(items) + page_size - 1) // page_size)
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        chunk = items[start:start + page_size]
+        rows = [f"| {start + i} | {nm} | {val} |" for i, (nm, val) in enumerate(chunk, start=1)]
+        if len(rows) < 3:  # 与 CaiBotLite 一致：不足 3 行补空行，表格不塌
+            rows += ["| - | - | - |"] * (3 - len(rows))
+        table = "\n".join(["| 排名 | 名字 | 项目 |", "| :--: | --- | --- |"] + rows)
+        return table, page, total_pages
+
+    @staticmethod
+    def _rank_args(toks: list):
+        """解析「排行 <序号> <项目> ...」里 <项目> 之后的参数与页码。
+
+        返回 (arg, page)：末尾是纯数字且参数不止一个 token 时，把末尾当页码——
+        这样含空格的参数（如 boss 名 `Moon Lord`、`Skeletron Prime`）不会被切碎。
+        """
+        extra = toks[2:]
+        if len(extra) >= 2 and extra[-1].isdigit():
+            return " ".join(extra[:-1]), int(extra[-1])
+        return " ".join(extra), 1
+
+    @staticmethod
+    def _rank_keyboard(seq: int, rank_type: str, arg: str, page: int, total_pages: int):
+        """翻页按钮（type=2 指令按钮，点击即发送 `排行 <序号> <项目> [参数] <页码>`）"""
+        if total_pages <= 1:
+            return None
+        base = f"排行 {seq} {rank_type}" + (f" {arg}" if arg else "")
+        rows = [KeyboardRow(buttons=[
+            Button(id="rank_prev", render_data=RenderData(label="⬅️ 上一页", style=1),
+                   action=Action(type=2, permission=Permission(type=2),
+                                 data=f"{base} {max(1, page - 1)}")),
+            Button(id="rank_next", render_data=RenderData(label="下一页 ➡️", style=1),
+                   action=Action(type=2, permission=Permission(type=2),
+                                 data=f"{base} {min(total_pages, page + 1)}")),
+        ])]
+        return KeyboardPayload(content=Keyboard(rows=rows))
+
+    async def cmd_rank(self, message, text: str, gid, user_openid: str = ""):
+        """排行 <序号> <项目> [参数] [页码]：拉取插件排行榜并以 markdown 表格分页展示（所有人可用）"""
+        gid = gid or (getattr(message, "group_openid", None) or "")
+        title = self.build_card_title("排行")
+        rest = text[len("排行"):].lstrip("：: \t").strip()
+        toks = rest.split()
+        if not toks or not toks[0].isdigit():
+            await self._reply_markdown(message, "\n".join([
+                title, "",
+                "**❌ 参数不完整喵...**", "",
+                "格式：`排行 <服务器序号> <项目> [参数] [页码]`",
+                "> 项目：`死亡` / `在线` / `钓鱼` / `金币`（需参数：货币名）/ `boss`（需参数：boss 名）",
+            ]))
+            return
+        seq = int(toks[0])
+        rank_type = toks[1] if len(toks) > 1 else ""
+        extra = toks[2:]
+        if not rank_type:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 请带上排行项目喵**", "",
+                "> 例：`排行 1 死亡`、`排行 1 boss 克苏鲁之眼`、`排行 1 金币 幻影币`",
+            ]))
+            return
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
+            return
+        arg, want_page = self._rank_args(toks)
+        ok, data = await self.zse_server.request_rank(server_code, rank_type, arg, timeout=20)
+        if not ok or not isinstance(data, dict):
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 排行榜获取失败喵...**", f"> 原因：{self._reason_of(data)}"]))
+            return
+        # 无效项目 → 回显该服务器支持的排行类型
+        if not data.get("rank_type_support"):
+            types = "、".join(str(x) for x in (data.get("support_rank_types") or []))
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 无效的排行项目喵...**", "",
+                f"> 该服务器支持：{types or '（无）'}",
+            ]))
+            return
+        if data.get("need_arg"):
+            page = want_page
+            if not data.get("arg_support"):
+                sargs = "、".join(str(x) for x in (data.get("support_args") or []))
+                await self._reply_markdown(message, "\n".join([
+                    title, "", f"**⚠️ {data.get('message') or '需要参数喵'}**",
+                    f"> 支持参数：{sargs or '（无）'}",
+                ]))
+                return
+        else:
+            page = int(extra[0]) if extra and extra[0].isdigit() else 1
+            arg = ""
+        rank = data.get("rank") or {}
+        lines = rank.get("rank_lines") or {}
+        title_txt = _md_safe(rank.get("title") or rank_type)
+        if not lines:
+            await self._reply_markdown(message, "\n".join([title, "", "> 该排行榜暂无数据喵"]))
+            return
+        # ① 优先出图片卡（竖屏背景）
+        png = None
+        try:
+            querier = self.whitelist_store.find_by_openid(self._eff_gid(gid), user_openid) or "群友"
+            png, page, total_pages = render_rank_card(
+                lines, page=page, page_size=RANK_PAGE_SIZE, title=title_txt,
+                server_name=rec.get("server_name") or f"服务器 {seq}", querier=querier,
+                bg_dir=self._rank_bg_dir(),
+            )
+        except Exception as e:
+            _log.exception("排行卡渲染失败: %s", e)
+            png = None
+        if png:
+            try:
+                await send_group_image(self, gid, png, filename="rank.png",
+                                       msg_id=getattr(message, "id", None))
+                # 图片消息本身挂不了键盘：仅当多页时补发一条只含翻页按钮的卡片
+                kb = self._rank_keyboard(seq, rank_type, arg, page, total_pages)
+                if kb:
+                    await self._reply_markdown_kb(
+                        message,
+                        "\n".join([
+                            self.build_card_title(f"排行 · {title_txt}"), "",
+                            f"> 第 **{page}** / **{total_pages}** 页｜共 {len(lines)} 条｜点下方按钮翻页",
+                        ]),
+                        kb)
+                return
+            except Exception as e:
+                _log.warning("排行图片发送失败，降级 markdown 表格: %s", e)
+        # ② 降级：markdown 表格 + 翻页按钮
+        table, page, total_pages = self._rank_table(lines, page, page_size=RANK_PAGE_SIZE)
+        content = "\n".join([
+            self.build_card_title(f"排行 · {title_txt}"), "",
+            table, "",
+            f"> 第 **{page}** / **{total_pages}** 页｜共 {len(lines)} 条｜服务器 `{rec.get('server_name') or seq}`",
+        ])
+        await self._reply_markdown_kb(
+            message, content, self._rank_keyboard(seq, rank_type, arg, page, total_pages))
+
+    async def _download_file(self, message, text: str, gid, kind: str, prefixes: tuple):
+        """下载地图(world)/下载小地图(map) 公共实现：取文件 -> 群文件发送（被动优先，失败转主动）"""
+        gid = gid or (getattr(message, "group_openid", None) or "")
+        label = "下载地图" if kind == "world" else "下载小地图"
+        rest = text
+        for p in prefixes:
+            if rest.startswith(p):
+                rest = rest[len(p):]
+                break
+        toks = rest.lstrip("：: \t").strip().split(None, 1)
+        if not toks or not toks[0].isdigit():
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(label), "",
+                "**❌ 参数不完整喵...**", "", f"格式：`{label} <服务器序号>`",
+            ]))
+            return
+        seq = int(toks[0])
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(label), "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(label), "", "**❌ 该服务器标识无效喵...**"]))
+            return
+        if kind == "world":
+            ok, data = await self.zse_server.request_world_file(server_code, timeout=180)
+            fallback = f"世界{seq}.wld"
+        else:
+            ok, data = await self.zse_server.request_map_file(server_code, timeout=180)
+            fallback = f"地图{seq}.map"
+        if not ok or not isinstance(data, dict) or not data.get("base64"):
+            reason = self._reason_of(data)
+            if isinstance(data, dict) and data.get("error"):
+                reason = str(data.get("error"))
+            if kind == "map":
+                reason += "（小地图需要服务器安装 GenerateMap 插件）"
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(label), "", "**❌ 文件获取失败喵...**", f"> 原因：{reason}"]))
+            return
+        try:
+            blob = decode_compressed_b64(data["base64"])
+        except Exception as e:
+            _log.exception("文件解压失败: %s", e)
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(label), "", f"**❌ 文件解压失败喵...**", f"> 原因：{e}"]))
+            return
+        fname = data.get("name") or fallback
+        ok_send = False
+        try:
+            await send_group_file(self, gid, blob, fname, file_type=4,
+                                  msg_id=getattr(message, "id", None))
+            ok_send = True
+        except Exception as e:
+            _log.warning("群文件被动发送失败(%s)，改主动发送重试: %s", fname, e)
+            try:
+                await send_group_file(self, gid, blob, fname, file_type=4)
+                ok_send = True
+            except Exception as e2:
+                _log.warning("群文件主动发送也失败: %s", e2)
+                await self._reply_markdown(message, "\n".join([
+                    self.build_card_title(label), "",
+                    f"**⚠️ 文件发送失败喵...**（{len(blob) / 1048576:.2f} MB）",
+                    f"> 原因：{e2}"]))
+        if ok_send:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(label), "",
+                f"### ✅ 已发送 `{fname}`",
+                f"> 大小 **{len(blob) / 1048576:.2f} MB**｜服务器 `{rec.get('server_name') or seq}`",
+            ]))
+
+    async def cmd_download_world(self, message, text: str, gid):
+        """下载地图 <序号>：以群文件发送服务器当前世界存档（.wld）"""
+        await self._download_file(message, text, gid, "world",
+                                  ("下载世界文件", "下载存档", "下载地图"))
+
+    async def cmd_download_map(self, message, text: str, gid):
+        """下载小地图 <序号>：以群文件发送 GenerateMap 生成的小地图（.map）"""
+        await self._download_file(message, text, gid, "map",
+                                  ("下载小地图文件", "下载小地图"))
+
     async def cmd_say(self, message, text: str, gid):
         """喊话 <服务器序列号> <内容>：向指定服务器广播（= 服内 /say），任何人可发"""
         gid = gid or (getattr(message, "group_openid", None) or "")
@@ -1653,7 +2237,7 @@ class GroupReviewClient(botpy.Client):
         )
 
     async def cmd_say_all(self, message, text: str, gid):
-        """全服喊话 <内容>：对所有在线服务器广播"""
+        """全服喊话 <内容>：对所有在线服务器广播（管理员及以上，分发处 _perm_ok 校验）"""
         gid = gid or (getattr(message, "group_openid", None) or "")
         parts = text.split(None, 1)
         if len(parts) < 2:
@@ -1822,8 +2406,8 @@ class GroupReviewClient(botpy.Client):
         return str(data or "未知错误")
 
     def _render_vote_png(self, vote, tally, status: str = "open") -> bytes:
-        """渲染投票卡为 PNG bytes（临时文件中转）"""
-        fd, tmp = tempfile.mkstemp(suffix=".png")
+        """渲染投票卡为 JPEG bytes（临时文件中转；JPEG 比 PNG 小约 5 倍）"""
+        fd, tmp = tempfile.mkstemp(suffix=".jpg")
         os.close(fd)
         try:
             render_vote_card(tmp, vote, tally, status=status, bg_dir=self._vote_bg_dir())
@@ -1845,7 +2429,7 @@ class GroupReviewClient(botpy.Client):
         ok_cnt, failed = 0, []
         for g in (gids or []):
             try:
-                await send_group_image(self, g, png, filename="vote.png")
+                await send_group_image(self, g, png, filename="vote.jpg")
                 ok_cnt += 1
             except Exception as e:
                 _log.warning("投票卡发布失败 group=%s: %s", (g or "")[:8], e)
@@ -1900,7 +2484,7 @@ class GroupReviewClient(botpy.Client):
                 return
             options, err = generate_random_options(
                 cfg.get("seed_list"), cfg.get("min"), cfg.get("max"),
-                option_count=self._vote_option_count())
+                option_count=min(VOTE_RANDOM_OPTIONS, self._vote_option_count()))
         if err or not options:
             await self._reply_markdown(message, "## ꧁༺ 种子投票 ༻꧂\n\n"
                                        f"**❌ 候选解析失败：{err or '没有可用候选'}喵...**")
@@ -1910,6 +2494,7 @@ class GroupReviewClient(botpy.Client):
             vote_id = self.votes.create_vote(
                 server_code, origin_gid=gid, zone_gids=zone_gids, options=options,
                 snapshot=snapshot, deadline_hours=self._vote_deadline_hours(),
+                max_options=self._vote_max_options(),
                 update_interval_minutes=self._vote_update_minutes(),
                 title="下个档玩什么")
         except ValueError as e:
@@ -1970,12 +2555,16 @@ class GroupReviewClient(botpy.Client):
                                        "**该服务器当前没有进行中的投票喵...**")
             return
         vote_id = vote["vote_id"]
-        winner = self.votes.finish_vote(vote_id)
-        vote = self.votes.get_vote(vote_id)
-        tally = self.votes.tally(vote_id)
-        # 推送目标：按发起群实时计算联合区（避免用创建时快照导致新增/退出群漏发/多发）
-        zone_gids = self._vote_target_gids(vote)
-        ok_cnt, failed = await self._publish_vote_card(zone_gids, vote, tally, "closed")
+        # 整个"截止 → 发结果卡 → 标记已发布"必须在锁内完成，
+        # 否则 60 秒调度会在发卡途中看到"未发布"而补发一轮（每个群多一张卡）
+        async with self._vote_pub_lock:
+            winner = self.votes.finish_vote(vote_id)
+            vote = self.votes.get_vote(vote_id)
+            tally = self.votes.tally(vote_id)
+            # 推送目标：按发起群实时计算联合区（避免用创建时快照导致新增/退出群漏发/多发）
+            zone_gids = self._vote_target_gids(vote)
+            ok_cnt, failed = await self._publish_vote_card(zone_gids, vote, tally, "closed")
+            self.votes.mark_result_published(vote_id)
         lines = ["## ꧁༺ 结束投票 ༻꧂", "",
                  f"**✅ 投票已结束**（结果卡已发布至 {ok_cnt}/{len(zone_gids)} 个群）", ""]
         if winner:
@@ -2062,6 +2651,10 @@ class GroupReviewClient(botpy.Client):
         """进度卡背景图目录；未配置返回 None（渲染模块自动复用查背包背景）"""
         d = (self._vote_config.get("bg_dir") or "").strip()
         return d or None
+
+    def _rank_bg_dir(self):
+        """排行卡背景目录；未配置返回 None（渲染模块自动用 assets/rank/backgrounds）"""
+        return (self._vote_config.get("rank_bg_dir") or "").strip() or None
 
     def _progress_tip(self, seq: int, boss_key: str) -> str:
         """统一生成取消提示（中文名 + 英文 key 两种都能用）"""
@@ -2229,6 +2822,18 @@ class GroupReviewClient(botpy.Client):
         boss_key = payload.get("boss_key") or ""
         if not server_code or not boss_key:
             return
+        # 幂等：以「服务器 + boss + 击杀时间 + 世界名」为键，同一场首杀只播一轮
+        fire_key = "|".join([server_code, boss_key,
+                             str(payload.get("kill_time") or ""),
+                             str(payload.get("world_name") or "")])
+        now = time.time()
+        if self._notify_fired.get(fire_key):
+            _log.info("首杀推送重复，已忽略 boss=%s server=%s", boss_key, server_code[:8])
+            return
+        self._notify_fired[fire_key] = now
+        if len(self._notify_fired) > 800:      # 只保留 24 小时，防止无限增长
+            for k in [k for k, t in self._notify_fired.items() if now - t > 86400]:
+                self._notify_fired.pop(k, None)
         gids = self.progress_notifies.subscribers_for(server_code, boss_key)
         if not gids:
             _log.info("首杀推送无任何群订阅，忽略 boss=%s server=%s", boss_key, server_code[:8])
@@ -2498,6 +3103,18 @@ class GroupReviewClient(botpy.Client):
                 f"**❌ 存档导出失败，已中止重置喵...**\n\n> 原因：{self._reason_of(data)}\n> 可稍后重试")
             return
         zip_name = data.get("name") or "archive.zip"
+        # ①.5 强制结束该服务器进行中的投票并结算（重置会重建世界，票不该继续投）
+        closed_note = ""
+        try:
+            closed_vote = await self._force_close_vote(server_code)
+            if closed_vote:
+                wno = closed_vote.get("winner_no")
+                wopt = next((o for o in (closed_vote.get("options") or [])
+                             if int(o.get("no") or -1) == int(wno or -1)), None)
+                closed_note = "\n- 已强制结算进行中的投票" + (
+                    f"（获胜：{wopt.get('name')}）" if wopt else "（本场无有效投票）")
+        except Exception as e:
+            _log.warning("重置时强制结算投票失败: %s", e)
         # ② 有「已结束且未使用」的投票结果 → set_seed 写入获胜种子 + 标记已使用；无则走插件预设
         pending = self.votes.pending_result(server_code)
         pending_vote = self.votes.get_vote(pending["vote_id"]) if pending else None
@@ -2558,7 +3175,97 @@ class GroupReviewClient(botpy.Client):
             f"**✅ 重置已触发**\n\n"
             f"- 种子来源：{seed_source}\n"
             f"- 存档推送：成功 {ok_cnt}/{len(targets)} 个群\n"
-            f"- 存档文件：`{zip_name}`" + self._vote_failed_line(failed))
+            f"- 存档文件：`{zip_name}`" + closed_note + self._vote_failed_line(failed))
+
+    async def cmd_backup(self, message, text: str, gid, user_openid: str = ""):
+        """备份 [发送] <序号>：把存档打包备份到服务器（加"发送"则额外把 zip 推到本群）"""
+        title = self.build_card_title("备份")
+        rest = text[len("备份"):].lstrip("：: \t").strip()
+        toks = rest.split()
+        send_to_group = bool(toks) and toks[0] in ("发送", "发", "群里", "发到群里")
+        if send_to_group:
+            toks = toks[1:]
+        seq = int(toks[0]) if toks and toks[0].isdigit() else None
+        if seq is None:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**格式：** `备份 [发送] <服务器序号>`", "",
+                "> `备份 1`：只备份到服务器（推荐，不刷群、快）",
+                "> `备份 发送 1`：备份并把 zip 发到本群（存档大时会很慢）",
+            ]))
+            return
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
+            return
+        ok, data = await self.zse_server.request_archive_export(
+            server_code, timeout=300, action="" if send_to_group else "backup")
+        if not ok or not isinstance(data, dict) or data.get("error") or not data.get("name"):
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 备份失败喵...**", "",
+                f"> 原因：{self._reason_of(data)}",
+                "> 若提示插件版本不支持，请让服主更新 starZSEbot 插件",
+            ]))
+            return
+        name = data.get("name")
+        size = int(data.get("size") or 0)
+        lines = [title, "", "**✅ 存档已备份到服务器**", "",
+                 f"- 文件：`{name}`",
+                 f"- 大小：{size / 1024 / 1024:.1f} MB" if size else "- 大小：—",
+                 "- 位置：`tshock/starZSEBot/Exports/`（按配置自动只保留最近若干份）"]
+        pushed = None
+        if send_to_group:
+            b64 = data.get("base64") or ""
+            if b64:
+                fd, zip_path = tempfile.mkstemp(suffix=".zip")
+                os.close(fd)
+                try:
+                    with open(zip_path, "wb") as f:
+                        f.write(decode_archive_zip(b64))
+                    await send_group_file(self, gid, zip_path, name, file_type=4)
+                    pushed = True
+                except Exception as e:
+                    _log.warning("备份 zip 推送失败: %s", e)
+                    pushed = False
+                finally:
+                    try:
+                        os.remove(zip_path)
+                    except OSError:
+                        pass
+        if send_to_group:
+            lines.append(f"- 已发送到本群：{'是' if pushed else '失败（存档已备份在服务器）'}")
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def _force_close_vote(self, server_code: str):
+        """强制结束该服务器进行中的投票并结算（发结果卡到联合区）。
+
+        用于 /重置：重置会重建世界，投票结果随即被本次重置采用，
+        所以先把进行中的投票结算掉（`pending_result` 才能取到获胜组合）。
+        返回被结束的投票记录；没有进行中的投票则返回 None。
+        """
+        if not server_code:
+            return None
+        vote = self.votes.get_active(server_code)
+        if not vote:
+            return None
+        vote_id = vote.get("vote_id")
+        async with self._vote_pub_lock:
+            vote = self.votes.get_vote(vote_id)
+            if not vote or vote.get("status") != "open":
+                return None        # 已被 结束投票/调度 结算
+            self.votes.finish_vote(vote_id)
+            vote = self.votes.get_vote(vote_id)
+            try:
+                tally = self.votes.tally(vote_id)
+                await self._publish_vote_card(self._vote_target_gids(vote), vote, tally, "closed")
+            except Exception as e:
+                _log.warning("重置时发布投票结果卡失败: %s", e)
+            self.votes.mark_result_published(vote_id)
+        _log.info("重置触发：已强制结算进行中的投票 %s", vote_id)
+        return vote
 
     # ───────────────────────── 种子投票后台调度 ─────────────────────────
     async def vote_scheduler(self):
@@ -2571,24 +3278,382 @@ class GroupReviewClient(botpy.Client):
                 await self._vote_tick()
             except Exception as e:
                 _log.exception("种子投票调度出错: %s", e)
+            try:
+                await self._server_status_tick()
+            except Exception as e:
+                _log.exception("服务器状态通知出错: %s", e)
+
+    @staticmethod
+    def _fmt_secs(sec) -> str:
+        try:
+            sec = max(0, int(sec))
+        except (TypeError, ValueError):
+            sec = 0
+        d, rem = divmod(sec, 86400)
+        h, rem = divmod(rem, 3600)
+        m = rem // 60
+        if d:
+            return f"{d} 天 {h} 小时"
+        if h:
+            return f"{h} 小时 {m} 分"
+        return f"{m} 分钟"
+
+    async def _server_status_tick(self):
+        """服务器上/下线通知（60 秒一轮）。
+
+        只在「状态稳定切换」时播报：插件崩溃、TShock 重启、网络抖动都不会立刻刷群。
+        每个群可用「服务器通知 关」关闭。
+        """
+        now = int(time.time())
+        for rec in self.zse_server.all_records():
+            code = rec.get("code") or ""
+            if not code:
+                continue
+            gid = self._eff_gid(rec.get("owner_gid") or "")
+            if not gid or not self.perms.notify_server_status(gid):
+                continue
+            ev = self.status_store.observe(code, self.zse_server.is_alive(rec), now)
+            if not ev:
+                continue
+            event, prev_since = ev
+            name = _md_safe(rec.get("server_name") or f"服务器 {rec.get('seq')}")
+            addr = f"{rec.get('ip') or ''}:{rec.get('port') or ''}"
+            elapsed = self._fmt_secs(now - int(prev_since or now))
+            if event == "offline":
+                title = "服务器掉线"
+                body = f"**{name}** 已离线"
+                extra = f"> 掉线前已在线：{elapsed}" if prev_since else "> 无法确定已在线时长"
+            else:
+                title = "服务器上线"
+                body = f"**{name}** 已恢复在线"
+                extra = f"> 掉线时长：{elapsed}" if prev_since else "> 首次观测到在线"
+            try:
+                await self.api.post_group_message(
+                    group_openid=gid, msg_type=2,
+                    markdown=MarkdownPayload(content="\n".join([
+                        self.build_card_title(title), "",
+                        body,
+                        f"> 地址：`{addr}`",
+                        extra, "",
+                        "> 可用 `服务器通知 关` 关闭本群通知",
+                    ])))
+            except Exception as e:
+                _log.warning("服务器状态通知发送失败 group=%s: %s", gid, e)
 
     async def _vote_tick(self):
+        # 先算出本轮要截止的投票：这些不再发"更新卡"，否则同一时刻会先来一张投票卡、再来一张结果卡
+        closing = {r.get("vote_id") for r in self.votes.due_closes()}
         for r in self.votes.due_updates():
+            if r.get("vote_id") in closing:
+                continue
             vote = self.votes.get_vote(r.get("vote_id"))
             if not vote or vote.get("status") != "open":
                 continue
             tally = self.votes.tally(r.get("vote_id"))
             await self._publish_vote_card(self._vote_target_gids(vote), vote, tally, "open")
             self.votes.mark_update_sent(r.get("vote_id"))
+
         for r in self.votes.due_closes():
-            # finish 幂等：仅对调用前仍为 open 的发布结果卡
-            vote = self.votes.get_vote(r.get("vote_id"))
-            if not vote or vote.get("status") != "open":
+            # 与「结束投票」指令互斥：两边同时发布会让每个群多收一张结果卡
+            async with self._vote_pub_lock:
+                # finish 幂等：加锁后再确认一次仍为 open
+                vote = self.votes.get_vote(r.get("vote_id"))
+                if not vote or vote.get("status") != "open":
+                    continue
+                self.votes.finish_vote(r.get("vote_id"))
+                vote = self.votes.get_vote(r.get("vote_id"))
+                tally = self.votes.tally(r.get("vote_id"))
+                await self._publish_vote_card(self._vote_target_gids(vote), vote, tally, "closed")
+                self.votes.mark_result_published(r.get("vote_id"))
+
+        # 结果卡补发：机器人若正好在 finish_vote 与发卡之间崩溃/重启，
+        # 该投票已是 closed（due_closes 不会再返回它）但结果卡从未发出 → 这里补发，成功才标记。
+        # min_age=90：刚结束的投票可能正在被「结束投票」指令或本轮调度发布，跳过它避免重复发卡。
+        for r in self.votes.unpublished_closed(min_age=90):
+            async with self._vote_pub_lock:
+                vote = self.votes.get_vote(r.get("vote_id"))
+                if not vote:
+                    self.votes.mark_result_published(r.get("vote_id"))
+                    continue
+                try:
+                    tally = self.votes.tally(r.get("vote_id"))
+                    await self._publish_vote_card(self._vote_target_gids(vote), vote, tally, "closed")
+                    self.votes.mark_result_published(r.get("vote_id"))
+                    _log.warning("已补发漏掉的投票结果卡: %s", r.get("vote_id"))
+                except Exception as e:
+                    # 发卡失败就下轮再试（不标记，保持「未发布」状态）
+                    _log.warning("补发投票结果卡失败（下轮重试）: %s", e)
+
+    # ───────────────────────── 种子列表 / 提案 ─────────────────────────
+    def _vote_max_options(self) -> int:
+        return max(2, self._vote_option_count())
+
+    def _seed_parse_nos(self, expr):
+        """解析 `1+2+3`（也支持 , ，、 空格 分割）→ (nos, err)"""
+        nos, bad = [], []
+        for part in re.split(r"[+＋,，、\s]+", str(expr or "").strip()):
+            if not part:
                 continue
-            self.votes.finish_vote(r.get("vote_id"))
-            vote = self.votes.get_vote(r.get("vote_id"))
-            tally = self.votes.tally(r.get("vote_id"))
-            await self._publish_vote_card(self._vote_target_gids(vote), vote, tally, "closed")
+            if part.isdigit():
+                nos.append(int(part))
+            else:
+                bad.append(part)
+        if bad:
+            return [], f"种子序号必须是数字：{'、'.join(bad[:3])}"
+        if not nos:
+            return [], "请给出种子序号，例如 `1+2+3`"
+        return nos, None
+
+    async def _republish_vote_card(self, vote) -> int:
+        """提案变动后立刻把投票卡重发到联合区（不等下一个更新周期），并标记已更新"""
+        if not vote:
+            return 0
+        try:
+            tally = self.votes.tally(vote["vote_id"])
+            ok_cnt, _failed = await self._publish_vote_card(
+                self._vote_target_gids(vote), vote, tally, "open")
+            self.votes.mark_update_sent(vote["vote_id"])
+            return ok_cnt
+        except Exception as e:
+            _log.warning("提案后重发投票卡失败: %s", e)
+            return 0
+
+    async def cmd_seed_list(self, message, text: str, gid: str = ""):
+        """种子列表 [页码]：图片卡展示常规/秘密世界种子（序号供 种子提案 引用，所有人可用）"""
+        send_gid = gid or (getattr(message, "group_openid", None) or "")
+        title = self.build_card_title("种子列表")
+        if not self.seeds.available():
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 种子数据未部署喵...**",
+                "> 请让服主运行 `scripts/fetch_seed_list.py`",
+            ]))
+            return
+        toks = text[len("种子列表"):].lstrip("：: \t").split()
+        page = int(toks[0]) if toks and toks[0].isdigit() else 1
+        pages = self.seeds.pages()
+        total = max(1, len(pages))
+        page = max(1, min(page, total))
+        rows = pages[page - 1]
+        subtitle = ((rows[0].get("category") or "") + "世界种子") if rows else ""
+        footer = "starZSEbot · 种子数据来自 terraria.wiki.gg（CC BY-SA）"
+        if total > 1:
+            footer += f" ｜ 翻页：种子列表 {page % total + 1}"
+        png = None
+        try:
+            png = render_seed_list_card(rows, page=page, total_pages=total, title="种子列表",
+                                        subtitle=subtitle, footer=footer,
+                                        bg_dir=self._vote_bg_dir())
+        except Exception as e:
+            _log.exception("种子列表卡渲染失败: %s", e)
+        if png:
+            try:
+                await send_group_image(self, send_gid, png, filename="seeds.jpg",
+                                       msg_id=getattr(message, "id", None))
+                return
+            except Exception as e:
+                _log.warning("种子列表卡发送失败，降级文本: %s", e)
+        lines = [title, "", f"> 第 {page} / {total} 页 · {subtitle}"]
+        for it in rows:
+            lines.append(f"- `{int(it.get('no') or 0):02d}` **{_md_safe(it.get('name'))}**"
+                         f"（输入 `{_md_safe(it.get('seed'))}`）")
+        if total > 1:
+            lines.append(f"> 翻页：`种子列表 {page % total + 1}`")
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def cmd_seed_propose(self, message, text: str, gid, user_openid: str = ""):
+        """种子提案 <服务器序号> <序号+序号…>：给该服务器进行中的投票追加候选（所有人可用）"""
+        title = self.build_card_title("种子提案")
+        seq, rest = parse_server_index(text[len("种子提案"):])
+        if seq is None or not str(rest or "").strip():
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**格式：** `种子提案 <服务器序号> <种子序号+…>`", "",
+                "> 序号见 `种子列表`，例：`种子提案 1 1+3+15`",
+                f"> 每人最多 {VOTE_PROPOSALS_PER_USER} 条在场；满 {VOTE_MAX_OPTIONS} 项后新提案顶掉最旧的（票会归还）",
+            ]))
+            return
+        if not self.seeds.available():
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 种子数据未部署喵...**"]))
+            return
+        nos, err = self._seed_parse_nos(rest)
+        if err:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+            return
+        entries, err = self.seeds.resolve(nos)
+        if err:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+            return
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        vote = self.votes.get_active(server_code) if server_code else None
+        if not vote:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**该服务器当前没有进行中的投票喵...**",
+                "> 可由服主用 `种子投票` 发起后再提案",
+            ]))
+            return
+        name = self.seeds.label(entries)
+        seed_vals = self.seeds.seed_values(entries)
+        ok, msg, info = self.votes.add_option(
+            vote["vote_id"], name, seed_vals,
+            proposer_openid=user_openid, proposer_name=self._disp(gid, user_openid),
+            max_options=self._vote_max_options(), per_user=VOTE_PROPOSALS_PER_USER)
+        if not ok:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {msg}**"]))
+            return
+        lines = [title, "", f"✅ {msg}", "", f"> 组合：`{_md_safe(name)}`",
+                 f"> 输入种子：`{_md_safe(' + '.join(seed_vals))}`"]
+        if info.get("replaced"):
+            lines.append(f"> ♻️ 已顶替最旧的「{_md_safe(info.get('replaced'))}」提案"
+                         f"（归还 {int(info.get('refunded') or 0)} 张票，编号已前移）")
+        await self._reply_markdown(message, "\n".join(lines))
+        await self._republish_vote_card(self.votes.get_vote(vote["vote_id"]))
+
+    async def cmd_seed_withdraw(self, message, text: str, gid, user_openid: str = ""):
+        """撤回提案 <服务器序号> <投票卡编号>：撤回自己提出的提案（票归还给投票人）"""
+        await self._seed_remove(message, text, gid, user_openid, "撤回提案", admin=False)
+
+    async def cmd_seed_delete(self, message, text: str, gid, user_openid: str = ""):
+        """删除提案 <服务器序号> <投票卡编号>：管理员删除任意提案（票归还给投票人）"""
+        await self._seed_remove(message, text, gid, user_openid, "删除提案", admin=True)
+
+    async def _seed_remove(self, message, text, gid, user_openid, cmd_name: str, admin: bool):
+        title = self.build_card_title(cmd_name)
+        seq, rest = parse_server_index(text[len(cmd_name):])
+        toks = (rest or "").split()
+        no = int(toks[0]) if toks and toks[0].isdigit() else None
+        if seq is None or no is None:
+            await self._reply_markdown(message, "\n".join([
+                title, "", f"**格式：** `{cmd_name} <服务器序号> <投票卡编号>`", "",
+                f"> 编号见投票卡，例：`{cmd_name} 1 4`",
+                "> 只能撤回自己提出的提案" if not admin else "> 管理员及以上可删除任意提案（含机器人随机项）",
+            ]))
+            return
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        vote = self.votes.get_active(server_code) if server_code else None
+        if not vote:
+            await self._reply_markdown(message, "\n".join([title, "", "**该服务器当前没有进行中的投票喵...**"]))
+            return
+        ok, msg, info = self.votes.remove_option(vote["vote_id"], no,
+                                                 openid=user_openid, admin=admin)
+        if not ok:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {msg}**"]))
+            return
+        lines = [title, "", f"✅ {msg}", "",
+                 f"> ♻️ 已归还 **{int(info.get('refunded') or 0)}** 张票（投票人可重新投给其他提案）",
+                 "> 其余编号已自动前移，请以新的投票卡为准"]
+        await self._reply_markdown(message, "\n".join(lines))
+        await self._republish_vote_card(self.votes.get_vote(vote["vote_id"]))
+
+    async def cmd_lexicon(self, message, text: str, kind: str, gid: str = ""):
+        """图鉴搜索：si/sn/sp/sb/sx（也支持 搜物品/搜生物/搜弹幕/搜增益/搜修饰）
+
+        命中 1 条 → 详情卡（图标 + 属性 + 说明）；多条 → 列表卡（图标 + 名称 + ID + 摘要）。
+        卡片渲染失败时降级为纯文本，功能不中断。
+        """
+        meta = lexicon.KINDS.get(kind) or {}
+        label = meta.get("label") or "图鉴"
+        title = meta.get("title") or label
+        cmd = _lexicon_match(text) or title
+        query = text[len(cmd):].lstrip("：: \t　").strip() if text.lower().startswith(cmd.lower()) else text.strip()
+        if not query:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(f"图鉴 · {label}"), "",
+                f"**格式：** `{title} <名字|ID>`",
+                f"> 例：`{title} 天顶剑`、`{title} 4956`",
+                "> 支持中文名、英文名、别名与数字 ID",
+            ]))
+            return
+        store = self.lexicon_store
+        if not store.available():
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(f"图鉴 · {label}"), "",
+                "**❌ 图鉴数据尚未部署喵...**",
+                "> 请让服主运行 `scripts/deploy_lexicon_assets.py`",
+            ]))
+            return
+        items, total = store.search(kind, query, limit=LEX_LIMIT)
+        if not items:
+            await self._reply_markdown(message, "\n".join([
+                self.build_card_title(f"图鉴 · {label}"), "",
+                f"**未找到与「{_md_safe(query)}」相关的条目喵...**",
+                "> 可以试试英文名、别名或数字 ID",
+            ]))
+            return
+        # 注意：这里必须用「发消息的那个群」的 openid。被动回复的 msg_id 与所在群绑定，
+        # 用 _eff_gid()（联合区总群）去发图片会被 QQ 判定「msg_id 无效或越权」(40034024) → 发图失败降级文本。
+        send_gid = gid or (getattr(message, "group_openid", None) or "")
+        png = None
+        try:
+            if total <= 1:
+                it = items[0]
+                desc_txt, desc_src = store.description_with_source(it)
+                # 资料 + 说明：同一张图里上下两个面板
+                # （务必把 desc_txt 传进来！曾经这里残留 desc="" 导致"有堆叠开关但没内容"→ 说明面板不画）
+                png = render_lexicon_card(label, query, "single",
+                                          item=dict(it, _id=it.get(meta.get("id"))),
+                                          attrs=store.attributes(kind, it),
+                                          desc=desc_txt,
+                                          icon_path=store.image_path(kind, it),
+                                          empty_desc_hint=("资料库中暂无该条目的说明"
+                                                           if not desc_txt and kind in ("item", "npc", "buff")
+                                                           else ""),
+                                          # 资料与说明分成上下两个独立面板（视觉上是两张卡）：
+                                          # 被动回复的 msg_id 只能用一次，第二条消息必然走「主动消息」，
+                                          # 而主动消息的内容审核会拦我们的卡片（实测 40034006 消息内容违规）
+                                          stack_desc=True,
+                                          footer=("starZSEbot · 图鉴（说明来自 terraria.wiki.gg）"
+                                                  if desc_src == "wiki" else ""),
+                                          bg_dir=self._vote_bg_dir())
+            else:
+                rows = [{"name": it.get("Name"), "id": it.get(meta.get("id")),
+                         "icon": store.image_path(kind, it),
+                         "summary": store.summary(kind, it)} for it in items]
+                png = render_lexicon_card(label, query, "list", rows=rows, total=total,
+                                          bg_dir=self._vote_bg_dir())
+        except Exception as e:
+            _log.exception("图鉴卡渲染失败: %s", e)
+            png = None
+        if png:
+            # 落盘最近一张卡：出问题时可直接下载核对（"我这边看不到说明"这类问题一眼定位）
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "last_lexicon.jpg"), "wb") as f:
+                    f.write(png)
+                if total <= 1:
+                    _log.info("图鉴卡已渲染: %s desc_src=%s desc_len=%d bytes=%d",
+                              _md_safe(items[0].get("Name") or ""),
+                              store.description_with_source(items[0])[1] or "无",
+                              len(store.description(items[0])), len(png))
+            except OSError as e:
+                _log.warning("图鉴卡落盘失败: %s", e)
+            try:
+                await send_group_image(self, send_gid, png, filename="lexicon.png",
+                                       msg_id=getattr(message, "id", None))
+                # 发送成功就必须结束：被动回复的 msg_id 只能用一次，
+                # 再发一条会被 QQ 判重（40054005 消息已去重，请勿重复 msgseq）
+                return
+            except Exception as e:
+                _log.warning("图鉴卡发送失败，降级文本: %s", e)
+        # 降级：纯文本
+        lines = [self.build_card_title(f"图鉴 · {label}"), ""]
+        if total <= 1:
+            it = items[0]
+            lines.append(f"**{_md_safe(it.get('Name'))}**（ID {it.get(meta.get('id'))}）")
+            lines += [f"- {_md_safe(k)}：{_md_safe(v)}" for k, v in store.attributes(kind, it)]
+            d = store.description(it)
+            if d:
+                lines += ["", *[f"> {_md_safe(x)}" for x in d.splitlines()[:8]]]
+        else:
+            lines.append(f"找到 **{total}** 条匹配（显示前 {len(items)} 条）：")
+            lines += [f"- {_md_safe(it.get('Name'))}（ID {it.get(meta.get('id'))}）" for it in items]
+        await self._reply_markdown(message, "\n".join(lines))
 
     async def cmd_exec(self, message, text: str, gid):
         """远程指令 <序号|all|*> <指令>：bot 以超管权限执行并返回服务器结果"""
@@ -2629,7 +3694,7 @@ class GroupReviewClient(botpy.Client):
             sname = self._server_name_plain(gid, seq) or "未知服务器"
             ok, out = await self.zse_server.exec_command(gid, seq, command, user_openid, gid)
             if ok and out not in ("（无输出）", ""):
-                result = out[:1000]
+                result = _md_fence_safe(out[:1000])   # 保留多行格式，只防围栏逃逸
             else:
                 result = "服务器返回了个棍母喵..."
             blocks.append(
@@ -2648,7 +3713,7 @@ class GroupReviewClient(botpy.Client):
     def _server_name_plain(self, gid: str, seq: int) -> str:
         """按展示序号取服务器显示名（纯名，无括号；其它群的服务器同样能取到）"""
         rec = self.zse_server.record_by_seq(gid, seq)
-        return (rec or {}).get("server_name") or ""
+        return _md_safe((rec or {}).get("server_name") or "")
 
     def _zone_other_ids(self, gid: str) -> str:
         """同联合区其它群的显示串（“群ID 1、群ID 3”）；没有则空串"""
@@ -2657,21 +3722,26 @@ class GroupReviewClient(botpy.Client):
         return "、".join(f"群ID {self.registry.join_id_of(g) or (g[:8] + '…')}" for g in others)
 
     async def cmd_bind_email(self, message, text: str, gid):
-        """绑定邮箱 <邮箱>：向该邮箱发送 4 位验证码（5 分钟有效，4 分钟限一次，单邮箱封顶 5 封）"""
+        """绑定邮箱 <QQ邮箱>：向该邮箱发送 6 位验证码（5 分钟有效，4 分钟限一次，单邮箱封顶 5 封）
+
+        只接受「纯数字@qq.com」——即 QQ 号本身：这样邮箱能直接对应到人，方便识别与追责开挂用户，
+        同时避免用任意邮箱充当身份凭据（用户口径，2026-10-04）。
+        """
         # 支持 "绑定邮箱：xxx@qq.com" 和 "绑定邮箱 xxx@qq.com"
         rest = text[len("绑定邮箱"):].lstrip("：: \t")
-        email = rest.strip()
+        email = rest.strip().lower()
         try:
             user_openid = message.author.member_openid or ""
         except AttributeError:
             user_openid = ""
-        if not email or "@" not in email or "." not in email.split("@")[-1]:
+        if not check_qq_email(email):
             await self._reply_markdown(
                 message,
                 "## ꧁༺ 白名单验证 ༻꧂\n\n"
-                "**邮箱格式不对喵...**\n\n"
-                "格式：`绑定邮箱 <您的邮箱>`\n"
-                "例：`绑定邮箱 1011819146@qq.com`",
+                "**❌ 只支持 QQ 邮箱，且必须是「QQ号@qq.com」形式喵**\n\n"
+                "格式：`绑定邮箱 <QQ号>@qq.com`\n"
+                "例：`绑定邮箱 1011819146@qq.com`\n\n"
+                "> 用 QQ 号是为了方便核对与追责，别填其他邮箱喵",
             )
             return
         ok, msg, _code = self.mail.request_code(user_openid, email, self._group_name(self._eff_gid(gid)), self.bot_name)
@@ -2864,12 +3934,12 @@ class GroupReviewClient(botpy.Client):
                 rest = text[len(kw):]
                 break
         new_email = rest.lstrip("：: \t").strip().lower()
-        if not new_email or "@" not in new_email or "." not in new_email.split("@")[-1]:
+        if not check_qq_email(new_email):
             await self._reply_markdown(
                 message,
                 "## ꧁༺ 邮箱改绑 ༻꧂\n\n"
-                "**邮箱格式不对喵...**\n\n"
-                "格式：`邮箱改绑 <新邮箱>`（也支持 `改绑邮箱 <新邮箱>`）\n"
+                "**❌ 只支持 QQ 邮箱，且必须是「QQ号@qq.com」形式喵**\n\n"
+                "格式：`邮箱改绑 <QQ号>@qq.com`（也支持 `改绑邮箱 <QQ号>@qq.com`）\n"
                 "例：`邮箱改绑 1011819146@qq.com`",
             )
             return
@@ -3884,6 +4954,30 @@ class GroupReviewClient(botpy.Client):
             ]),
         )
 
+    async def cmd_server_status_notify(self, message, text: str, gid, user_openid: str):
+        """服务器通知 [开|关]：服务器上线/掉线时是否在本群播报（无参数=切换）"""
+        rest = text[len("服务器通知"):].strip().lower()
+        cur = self.perms.notify_server_status(self._eff_gid(gid))
+        if not rest:
+            flag = not cur
+        elif rest in ("开", "开启", "on", "true", "1", "yes"):
+            flag = True
+        elif rest in ("关", "关闭", "off", "false", "0", "no"):
+            flag = False
+        else:
+            await self._reply_markdown(message, "\n".join([
+                "## ꧁༺ 服务器通知 ༻꧂", "",
+                "**参数格式错误喵...**", "",
+                "格式：`服务器通知 [开|关]`", "例：`服务器通知 关`",
+            ]))
+            return
+        _ok, msg = self.perms.set_notify_server_status(self._eff_gid(gid), flag, operator=user_openid)
+        await self._reply_markdown(message, "\n".join([
+            "## ꧁༺ 服务器通知 ༻꧂", "",
+            f"✅ 已{msg}「服务器上线/掉线通知」喵！", "",
+            "> 状态需稳定 2 分钟才播报（避免 TShock 重启/网络抖动刷屏）",
+        ]))
+
     async def cmd_online_show(self, message, text: str, gid, user_openid: str):
         """允许查看在线玩家 [开|关]：admin 及以上可切换在线玩家名单是否对普通群员可见（无参数=切换）"""
         rest = text[len("允许查看在线玩家"):].strip().lower()
@@ -3942,23 +5036,20 @@ class GroupReviewClient(botpy.Client):
                 if cmd == "about":
                     content = self._about_card(group_openid, clicker)  # 与"关于"指令共用模板
                 else:
-                    content = "\n".join(
-                        [
-                            self.build_card_title("帮助"),
-                            "### 发送关键词获取对应功能喵!",
-                            "---",
-                            "> 入群申请审核 / 退群通知 / 更多能力敬请期待",
-                        ]
-                    )
+                    # 旧卡片上的「帮助」按钮（type=1 回调）也切到新的帮助卡片内容
+                    content = self._help_index_card(group_openid, clicker)
                 # 标题下 @ 点击按钮的用户（与指令回复同款；clicker 为空时原样发送）
                 content = self._insert_executor_at(content, clicker)
                 at_tag = f'<qqbot-at-user id="{clicker}" />' if clicker else ""
                 # 按钮回调：优先用 event_id 当"事件被动回复"发送（免主动发言权限），失败降级普通发送；
                 # 全程 try 兜底，保证下面的 _reply_interaction 一定执行，避免按钮一直转圈/第三方失败
                 sent = False
-                for kwargs in ({"msg_type": 2, "markdown": MarkdownPayload(content=content),
-                                "event_id": getattr(interaction, "event_id", None)},
-                               {"msg_type": 2, "markdown": MarkdownPayload(content=content)}):
+                base = {"msg_type": 2, "markdown": MarkdownPayload(content=content)}
+                if cmd == "help":
+                    base["keyboard"] = self._help_keyboard(
+                        self._help_rank(group_openid, clicker))
+                for kwargs in (dict(base, event_id=getattr(interaction, "event_id", None)),
+                               dict(base)):
                     if not kwargs.get("event_id") and "event_id" in kwargs:
                         continue
                     try:
@@ -4049,7 +5140,9 @@ class GroupReviewClient(botpy.Client):
         _log.info("入群申请轮询已启动，间隔 %s 秒", self.poll_interval)
         while True:
             try:
-                for group_name, group_openid in self.groups.items():
+                # 取快照：on_group_add_robot/_capture_group 会在轮询期间往 self.groups 里加新群，
+                # 直接遍历 .items() 会 RuntimeError: dictionary changed size during iteration
+                for group_name, group_openid in list(self.groups.items()):
                     await self.check_one_group(group_name, group_openid)
             except Exception as e:
                 _log.exception("轮询出错: %s", e)
@@ -4089,6 +5182,9 @@ class GroupReviewClient(botpy.Client):
                 _log.info("[%s] 同一用户 1 分钟内重复申请，不再转发: %s（%s）", group_name, username, reason[:20])
                 continue
             self._apply_last_sent[key] = now
+            if len(self._apply_last_sent) > 2000:   # 清理 1 小时前的旧键，避免长期缓慢增长
+                for k in [k for k, t in self._apply_last_sent.items() if now - t > 3600]:
+                    self._apply_last_sent.pop(k, None)
             try:
                 await self.send_review_card(group_name, group_openid, req)
             except Exception as e:

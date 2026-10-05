@@ -65,6 +65,18 @@ _NAME_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z0-9 ]+")
 MAX_NAME_LENGTH = 15
 
 
+_QQ_EMAIL_RE = re.compile(r"^\d{5,12}@qq\.com$")
+
+
+def check_qq_email(email: str) -> bool:
+    """绑定邮箱只允许「纯数字@qq.com」= QQ 号本身。
+
+    用户口径（2026-10-04）：邮箱就是用来拿玩家 QQ 号、方便识别与追责开挂用户的，
+    所以不脱敏、也不允许随便填；同时它也因此成了强身份锚点，必须限制格式。
+    """
+    return bool(_QQ_EMAIL_RE.fullmatch((email or "").strip().lower()))
+
+
 def check_name_ok(name: str) -> bool:
     """合法：长度 1~15，仅汉字/字母/数字/空格（整体匹配，天然拒绝换行、引号等特殊符号）"""
     name = (name or "").strip()
@@ -164,8 +176,8 @@ class VerifyManager:
         if user_openid in self._verify_user and now <= self._verify_user[user_openid].get("expire", 0):
             del self._verify_user[user_openid]
 
-        # 4. 生成新验证码（4 位数字）
-        code = f"{random.randint(0, 9999):04d}"
+        # 4. 生成新验证码（6 位数字）
+        code = f"{random.randint(0, 999999):06d}"
         ok, msg = self.sender.send_code(email, code, group_name, bot_name)
         if not ok:
             return False, msg, ""
@@ -192,6 +204,13 @@ class VerifyManager:
         if not urec:
             return False, "验证码不存在或已过期，请重新申请喵", ""
         if urec.get("code") != code:
+            # 错误计数：连续错 5 次直接作废该验证码（6 位码也挡不住无限次爆破，必须限次）
+            urec["fails"] = int(urec.get("fails") or 0) + 1
+            if urec["fails"] >= 5:
+                self._verify_user.pop(user_openid, None)
+                self._save_verify()
+                return False, "验证码错误次数过多已作废，请重新申请喵", ""
+            self._save_verify()
             return False, "验证码错误喵，请核对后重试", ""
         if time.time() > urec.get("expire", 0):
             self._verify_user.pop(user_openid, None)
@@ -376,6 +395,11 @@ class WhitelistStore:
             cities.sort(key=lambda c: int(c.get("ts") or 0))
             del cities[:len(cities) - self._city_max]
 
+    @staticmethod
+    def synth_key(platform: str, city: str) -> str:
+        """空 UUID 客户端的合成设备键（平台+城市）；平台/城市缺失时用 ? 兜底保证稳定"""
+        return f"nouuid:{(platform or '?').strip().lower()}:{(city or '?').strip().lower()}"
+
     def _judge(self, rec: dict, uuid: str, platform: str, city: str) -> tuple[str, str]:
         """只读判定一条记录的设备/城市是否放行。返回 (result, reason)：
         设备命中 → 城市命中（或城市校验关闭/城市解析失败）放行，不在集合 → ip_change；
@@ -386,10 +410,21 @@ class WhitelistStore:
         if rec.get("need_relogin"):
             return "need_login", "new_device"  # 改名后：设备已清空，强制重新确认登录
         if not uuid:
-            return "accept", ""  # 客户端未上报 UUID：维持旧行为放行，避免误锁
+            # 客户端未上报 UUID（个别 PC 端）：**不能无条件放行**——否则清空 UUID 就能绕过设备校验冒充他人。
+            # 改用「平台+城市」合成设备键：无设备基线 → 首次放行并登记；已有基线 → 必须命中该合成键，
+            # 否则走群里批准一次（批准后同平台+同城市不再打扰）。
+            key = self.synth_key(platform, city)
+            if not devices:
+                return "accept", ""
+            if any((d.get("uuid") or "") == key for d in devices):
+                return "accept", ""
+            return "need_login", "new_device"
         for d in devices:
             if d.get("uuid") == uuid:
                 if self._city_check and city and not self._city_known(rec, city):
+                    return "need_login", "ip_change"
+                if self._city_check and not city and self._cities(rec):
+                    # 城市解析失败且记录已有城市基线 → fail-closed（对齐 CaiBotLite 的 try_login_ok）
                     return "need_login", "ip_change"
                 return "accept", ""
         if not devices:
@@ -587,8 +622,21 @@ class WhitelistStore:
             return result, "", reason
         now = int(time.time())
         devices = self._devices(rec)
-        hit = next((d for d in devices if d.get("uuid") == uuid), None) if uuid else None
-        if uuid and hit is None:
+        if not uuid:
+            # 空 UUID：登记/更新合成设备键（首次，或已批准后的同平台+同城市）
+            key = self.synth_key(platform, city)
+            hit0 = next((d for d in devices if (d.get("uuid") or "") == key), None)
+            if hit0 is None:
+                devices.append({"uuid": key, "platform": platform or "",
+                                "first_seen": now, "last_seen": now})
+            else:
+                hit0["last_seen"] = now
+            self._city_touch(rec, city)
+            rec["last_join_time"] = now
+            self._save()
+            return "accept", key, ""
+        hit = next((d for d in devices if d.get("uuid") == uuid), None)
+        if hit is None:
             # 首次设备：自动登记并放行
             devices.append({"uuid": uuid, "platform": platform or "", "first_seen": now, "last_seen": now})
             rec["uuid"] = uuid

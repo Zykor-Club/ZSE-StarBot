@@ -71,6 +71,9 @@ def _norm_option(opt: dict, no: int) -> dict:
         "name": name,
         "seeds": seeds,
         "proposer": str(opt.get("proposer") or ""),
+        "proposer_openid": str(opt.get("proposer_openid") or ""),
+        # 创建时间：满员时按它顶掉最旧的一条（同一批创建用 no 兜底）
+        "created_ts": float(opt.get("created_ts") or 0) or time.time(),
         "by_bot": bool(opt.get("by_bot")),
     }
 
@@ -219,7 +222,7 @@ class VoteStore:
     # ── 创建 ──
     def create_vote(self, server_code, origin_gid, zone_gids, options,
                     snapshot=None, deadline_hours=24, update_interval_minutes=60,
-                    title="下个档玩什么", now=None) -> str:
+                    title="下个档玩什么", now=None, max_options: int = 6) -> str:
         ts = time.time() if now is None else float(now)
         vote_id = f"{server_code}-{int(ts)}"
         with self._lock:
@@ -246,6 +249,8 @@ class VoteStore:
                 "winner_no": None,
                 "tie_random": False,
                 "options": opts,
+                # 选项上限（固定 6）：满员后新提案顶掉最旧的一条；卡片据此提示剩余空位
+                "max_options": max(2, int(max_options or 6)),
                 "snapshot": dict(snapshot or {}),
                 "user_votes": {},
             }
@@ -284,6 +289,106 @@ class VoteStore:
             uv[key] = mine
             self._write_locked()
             return True, f"已投给 {circ} {name}"
+
+    # ── 提案：追加 / 顶替 / 撤回 / 删除（仅进行中的投票） ──
+    def _remove_option_locked(self, r, no: int) -> int:
+        """删除某编号选项：**归还其票数**（从各用户投票列表移除 → 额度自动恢复），
+        并把其后编号整体前移（票号同步重映射）。返回归还的票数。"""
+        opts = r.get("options") or []
+        try:
+            no = int(no)
+        except (TypeError, ValueError):
+            return 0
+        if not any(int(o.get("no") or -1) == no for o in opts):
+            return 0
+        uv = r.get("user_votes") or {}
+        refunded = 0
+        for key, nos in list(uv.items()):
+            new = []
+            for n in nos or []:
+                try:
+                    n = int(n)
+                except (TypeError, ValueError):
+                    continue
+                if n == no:
+                    refunded += 1          # 归还：移除该票，用户可再投给别人
+                    continue
+                new.append(n - 1 if n > no else n)
+            uv[key] = new
+        r["options"] = [dict(o, no=(int(o["no"]) - 1 if int(o["no"]) > no else int(o["no"])))
+                        for o in opts if int(o.get("no") or -1) != no]
+        return refunded
+
+    def add_option(self, vote_id, name, seeds, proposer_openid="", proposer_name="",
+                   max_options: int = 6, per_user: int = 2):
+        """追加一个提案选项。返回 (ok, msg, info)。
+
+        规则：① 组合不能与现有选项重复；② 同一人最多 per_user 条在场；
+        ③ 满 max_options 时**顶掉最旧的一条**（其票数归还，其余编号前移），新提案成为最后一位。
+        """
+        with self._lock:
+            r = self._data.get(vote_id)
+            if not r:
+                return False, "投票不存在", {}
+            if r.get("status") != "open":
+                return False, "投票已结束，无法提案", {}
+            opts = r.setdefault("options", [])
+            norm = tuple(sorted(str(x).strip().lower() for x in (seeds or []) if str(x).strip()))
+            if not norm:
+                return False, "种子组合为空", {}
+            for o in opts:
+                cur = tuple(sorted(str(x).strip().lower() for x in (o.get("seeds") or [])))
+                if cur == norm:
+                    return False, f"已存在相同提案（{_circle_no(o.get('no'))} {o.get('name')}）", {}
+            openid = str(proposer_openid or "")
+            if openid:
+                mine = sum(1 for o in opts if str(o.get("proposer_openid") or "") == openid)
+                if mine >= int(per_user):
+                    return False, f"你最多只能有 {per_user} 条在场提案，先撤回一条吧", {}
+            info = {"replaced": "", "refunded": 0, "no": 0}
+            if len(opts) >= int(max_options):
+                oldest = min(opts, key=lambda o: (float(o.get("created_ts") or 0), int(o.get("no") or 0)))
+                info["refunded"] = self._remove_option_locked(r, int(oldest["no"]))
+                info["replaced"] = oldest.get("name") or ""
+                info["replaced_by_bot"] = bool(oldest.get("by_bot"))
+                # 重要：_remove_option_locked 是**整体替换** r["options"]（编号前移），
+                # 这里必须重新取引用，否则新提案会被追加到已废弃的旧列表上（曾导致提案丢失）
+                opts = r.get("options") or []
+            no = (max([int(o["no"]) for o in opts]) + 1) if opts else 1
+            opts.append({
+                "no": no, "name": name, "seeds": list(seeds or []),
+                "proposer": str(proposer_name or ""), "proposer_openid": openid,
+                "created_ts": time.time(), "by_bot": False,
+            })
+            opts.sort(key=lambda o: int(o["no"]))
+            info["no"] = no
+            self._write_locked()
+            return True, f"已提案：{_circle_no(no)} {name}", info
+
+    def remove_option(self, vote_id, no, openid="", admin: bool = False):
+        """撤回/删除提案：本人可撤自己的，管理员可删任意（含机器人随机项）。
+        返回 (ok, msg, info)；info 含 refunded（归还票数）与 name。"""
+        with self._lock:
+            r = self._data.get(vote_id)
+            if not r:
+                return False, "投票不存在", {}
+            if r.get("status") != "open":
+                return False, "投票已结束，无法修改提案", {}
+            try:
+                n = int(no)
+            except (TypeError, ValueError):
+                return False, "编号不存在", {}
+            opt = next((o for o in r.get("options") or [] if int(o.get("no") or -1) == n), None)
+            if opt is None:
+                return False, f"编号 {n} 不存在", {}
+            if not admin and str(opt.get("proposer_openid") or "") != str(openid or ""):
+                return False, "只能撤回自己提出的提案（管理员可用 删除提案）", {}
+            name = opt.get("name") or ""
+            by_bot = bool(opt.get("by_bot"))
+            refunded = self._remove_option_locked(r, n)
+            self._write_locked()
+            return True, ("已移除机器人随机提案：" if by_bot else "已移除提案：") + f"{_circle_no(n)} {name}", \
+                {"refunded": refunded, "name": name, "by_bot": by_bot}
 
     # ── 计票 ──
     def _tally_locked(self, r) -> dict:
@@ -358,6 +463,9 @@ class VoteStore:
                 return self._winner_from_record_locked(r)
             r["status"] = "closed"
             r["closed_at"] = _iso(now)
+            # 结果卡发布标记：先置 False，发卡成功后才置 True。
+            # 若机器人正好在 finish 与发卡之间重启，调度会据此外补发（见 unpublished_closed）。
+            r["result_published"] = False
             t = self._tally_locked(r)
             winner = self._pick_winner(t["options"])
             if winner:
@@ -396,6 +504,37 @@ class VoteStore:
             return None
         return {"no": o["no"], "name": o["name"], "score": o["score"],
                 "votes": o["votes"], "tie_random": bool(r.get("tie_random"))}
+
+    def mark_result_published(self, vote_id) -> bool:
+        """标记该投票的结果卡已发出（补发判断用）"""
+        with self._lock:
+            r = self._data.get(vote_id)
+            if not r:
+                return False
+            r["result_published"] = True
+            self._write_locked()
+            return True
+
+    def unpublished_closed(self, min_age: float = 0.0, now=None) -> list:
+        """已 closed 但结果卡还没发出去的投票（用于崩溃/重启后补发）。
+
+        min_age>0 时只返回"结束已超过 min_age 秒"的记录，避免与正在进行的发布抢跑。
+
+        只认**显式标记为 False** 的记录：升级前就已 closed 的老记录没有该字段，
+        会被视为已发布，避免升级后把历史投票结果又播一遍。
+        """
+        ts = time.time() if now is None else float(now)
+        with self._lock:
+            out = []
+            for r in self._data.values():
+                if r.get("status") != "closed" or r.get("result_published") is not False:
+                    continue
+                # min_age：跳过"刚结束"的投票——它可能正被结束投票指令/同一轮调度发布中，
+                # 否则会出现"结果卡发两轮"（每个群多一张卡）
+                if min_age and ts - _epoch(r.get("closed_at")) < float(min_age):
+                    continue
+                out.append({"vote_id": r.get("vote_id"), "server_code": r.get("server_code")})
+            return out
 
     # ── 结果领取 ──
     def _pending_locked(self, server_code):

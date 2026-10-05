@@ -86,7 +86,23 @@ class GroupRegistry:
         ent = groups.get(gid)
         if ent is not None:
             return ent
-        jid = self._data.get("next_id", 1)
+        # 回退保护：next_id 被手改/文件回滚/写盘失败时，可能与已分配的 join_id 撞车
+        # （撞车会导致服务器绑到别的群），这里先规整再跳过已用编号
+        try:
+            jid = int(self._data.get("next_id", 1))
+        except (TypeError, ValueError):
+            jid = 1
+        if jid < 1:
+            jid = 1
+        used = set()
+        for e in groups.values():
+            if isinstance(e, dict):
+                try:
+                    used.add(int(e.get("join_id") or 0))
+                except (TypeError, ValueError):
+                    continue
+        while jid in used:
+            jid += 1
         self._data["next_id"] = jid + 1
         ent = {
             "join_id": jid,
@@ -135,6 +151,41 @@ class GroupRegistry:
             if (ent or {}).get("master_gid") == master:
                 out.add(ogid)
         return out
+
+    def mark_kicked(self, gid: str) -> None:
+        """记录「机器人被移出该群」（持久化）：重新拉入时据此判断该群数据应作废重建"""
+        if not gid:
+            return
+        ent = self.get_or_assign(gid)
+        ent["kicked_at"] = int(time.time())
+        self._save()
+
+    def consume_kicked(self, gid: str) -> bool:
+        """取出并清除「被移出」标记；返回该群是否曾被移出机器人"""
+        ent = self._ent(gid)
+        if not ent or not ent.get("kicked_at"):
+            return False
+        ent.pop("kicked_at", None)
+        self._save()
+        return True
+
+    def unlink(self, gid: str) -> list:
+        """清除 gid 的联合关系：自己不认父群；若自己是总群则同时解散全部子群。返回受影响的群列表。
+
+        对齐 CaiBotLite 重新拉入时把 parent_open_id 置空的做法（配合 permissions.reset_group 使用）。
+        """
+        affected = []
+        ent = self._ent(gid)
+        if ent is not None and (ent.get("master_gid") or ""):
+            ent["master_gid"] = None
+            affected.append(gid)
+        for ogid, e in (self._data.get("groups", {}) or {}).items():
+            if e is not None and (e.get("master_gid") or "") == gid:
+                e["master_gid"] = None
+                affected.append(ogid)
+        if affected:
+            self._save()
+        return affected
 
     def zone_info(self, gid: str) -> dict:
         """联合区信息：{master_gid, master_join_id, joined_at, join_order, members:[{gid,join_id,joined_at,join_order}]}

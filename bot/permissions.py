@@ -68,11 +68,18 @@ PERM_VOTE_MANAGE = "vote_manage"  # 种子投票 / 结束投票
 PERM_VOTE_PUSH = "vote_push"      # 推送投票（向联合区所有群推卡）
 PERM_RESET = "reset"              # 重置（导出存档 → 触发重置 → 推送存档）
 PERM_PROGRESS_NOTIFY = "progress_notify"  # 进度提醒（设置/取消/列表）
+PERM_SAY_ALL = "say_all"          # 全服喊话（向所有在线服务器广播）
+PERM_STATUS_NOTIFY = "status_notify"  # 服务器上/下线通知（开关）
+PERM_VOTE_PROPOSAL_DEL = "vote_proposal_del"  # 删除提案（管理员及以上）
+PERM_BACKUP = "backup"  # 存档备份（管理员及以上）
 
 MIN_ROLE = {
     PERM_MAP_FETCH: MEMBER,        # member 直接通过，但群未开放时在 check 内拦截
     PERM_MAP_TOGGLE: ADMIN,
     PERM_ONLINE_SHOW: ADMIN,
+    PERM_STATUS_NOTIFY: ADMIN,
+    PERM_VOTE_PROPOSAL_DEL: ADMIN,
+    PERM_BACKUP: ADMIN,
     PERM_ADD_SERVER: MASTER,
     PERM_DEL_SERVER: MASTER,       # 归属（是否本人添加）在校验处单独判断
     PERM_EXEC: ADMIN,
@@ -82,6 +89,7 @@ MIN_ROLE = {
     PERM_VOTE_PUSH: ADMIN,
     PERM_RESET: MASTER,
     PERM_PROGRESS_NOTIFY: ADMIN,
+    PERM_SAY_ALL: ADMIN,
 }
 
 PERM_NEED_LABEL = {
@@ -97,6 +105,7 @@ PERM_NEED_LABEL = {
     PERM_VOTE_PUSH: "管理员及以上",
     PERM_RESET: "服主及以上",
     PERM_PROGRESS_NOTIFY: "管理员及以上",
+    PERM_SAY_ALL: "管理员及以上",
 }
 
 # 身份昵称 -> 身份 key（设置身份命令用）
@@ -116,7 +125,7 @@ class PermissionManager:
         "owners": ["openid", ...],       # 高级管理员（可多名）
         "masters": ["openid", ...],
         "admins":  ["openid", ...],
-        "config": {"allow_member_map": false, "show_online_players": true},  # 群开关 dict
+        "config": {"allow_member_map": false, "show_online_players": true, "notify_server_status": true},  # 群开关 dict
         "created_at": 时间戳,
         "audit": [ {"ts": .., "who": "..", "what": ".."}, ... ]  # 最近 100 条
       }
@@ -165,7 +174,7 @@ class PermissionManager:
         g = self._data.get(gid)
         if g is None:
             g = {"owners": [], "masters": [], "admins": [],
-                 "config": {"allow_member_map": False, "show_online_players": True},
+                 "config": {"allow_member_map": False, "show_online_players": True, "notify_server_status": True},
                  "created_at": int(time.time()), "audit": []}
             self._data[gid] = g
         return g
@@ -173,6 +182,7 @@ class PermissionManager:
     # ────────────── 审计 ──────────────
     def _audit(self, gid: str, who: str, what: str):
         g = self.group(gid)
+        g.setdefault("audit", [])
         g["audit"].append({"ts": int(time.time()), "who": who or "", "what": what})
         if len(g["audit"]) > 100:
             g["audit"] = g["audit"][-100:]
@@ -327,11 +337,24 @@ class PermissionManager:
             self._audit(gid, openid, "退群，移除身份")
             self._save()
 
+    def reset_group(self, gid: str, openid: str = "", note: str = "机器人被重新拉入群，身份重置") -> None:
+        """把某群身份重置为「只有拉入者一名高级管理员」。
+
+        语义对齐 CaiBotLite（event/add_robot.py：重新拉入时 admins 只留拉入者、parent_open_id 置空）：
+        机器人被踢后又被重新拉进群，视为该群数据作废，由拉入者重新开始。
+        """
+        g = self.group(gid)
+        g["owners"] = [openid] if openid else []
+        g["masters"] = []
+        g["admins"] = []
+        self._audit(gid, openid, note)
+        self._save()
+
     # ────────────── 群开关（config dict） ──────────────
     def _cfg(self, gid: str) -> dict:
         g = self.group(gid)
         if not isinstance(g.get("config"), dict):
-            g["config"] = {"allow_member_map": False, "show_online_players": True}
+            g["config"] = {"allow_member_map": False, "show_online_players": True, "notify_server_status": True}
         return g["config"]
 
     def map_allowed(self, gid: str) -> bool:
@@ -345,6 +368,16 @@ class PermissionManager:
 
     def show_online_players(self, gid: str) -> bool:
         return bool(self._cfg(gid).get("show_online_players", True))
+
+    def notify_server_status(self, gid: str) -> bool:
+        """服务器上/下线是否在本群通知（默认开；可在群里用「服务器通知 关」关闭）"""
+        return bool(self._cfg(gid).get("notify_server_status", True))
+
+    def set_notify_server_status(self, gid: str, flag: bool, operator: str = "") -> tuple[bool, str]:
+        self._cfg(gid)["notify_server_status"] = bool(flag)
+        self._audit(gid, operator, f"服务器上/下线通知 {'开' if flag else '关'}")
+        self._save()
+        return True, "已开启" if flag else "已关闭"
 
     def set_show_online_players(self, gid: str, flag: bool, operator: str = "") -> tuple[bool, str]:
         self._cfg(gid)["show_online_players"] = bool(flag)
@@ -361,4 +394,5 @@ class PermissionManager:
         lines.append(f"管理员：{'、'.join(self.members_of_role(gid, ADMIN)) or '（无）'}")
         lines.append(f"允许成员获取地图：{'已开启' if self.map_allowed(gid) else '已关闭'}")
         lines.append(f"允许查看在线玩家：{'已开启' if self.show_online_players(gid) else '已关闭'}")
+        lines.append(f"服务器上/下线通知：{'已开启' if self.notify_server_status(gid) else '已关闭'}")
         return "\n".join(lines)

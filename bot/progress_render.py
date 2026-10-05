@@ -496,7 +496,7 @@ def render_progress_card(payload: dict, server_name: str = "", querier: str = ""
 
     import io
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, "PNG")
+    img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True, progressive=True)
     return buf.getvalue()
 
 
@@ -581,7 +581,7 @@ def render_notify_card(boss_key: str, players=None, kill_time: str = "",
 
     import io
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, "PNG")
+    img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True, progressive=True)
     return buf.getvalue()
 
 
@@ -685,7 +685,7 @@ def render_unlock_card(boss_key: str, minutes_left: int = 30, unlock_ts: int = 0
 
     import io
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, "PNG")
+    img.convert("RGB").save(buf, "JPEG", quality=88, optimize=True, progressive=True)
     return buf.getvalue()
 
 

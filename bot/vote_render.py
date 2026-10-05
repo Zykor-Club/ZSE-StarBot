@@ -198,7 +198,8 @@ def _base_canvas(bg, w, h):
     return Image.alpha_composite(img, Image.new("RGBA", (w, h), (0, 0, 0, BG_DARKEN_ALPHA)))
 
 
-def render_vote_card(out_png, vote, tally, status="open", bg_dir=None, bg_file=None) -> str:
+def render_vote_card(out_png, vote, tally, status="open", bg_dir=None, bg_file=None,
+                     jpeg_quality: int = 88) -> str:
     """渲染投票卡到 out_png，返回 out_png。
 
     vote / tally 结构见 vote_store；status="open"/"closed"。
@@ -232,6 +233,13 @@ def render_vote_card(out_png, vote, tally, status="open", bg_dir=None, bg_file=N
     if st == "open":
         rule_lines.append(f"截止时间：{deadline}")
         foot_lines = ["发送「投票 编号」参与", "每人可投 2 个组合"]
+        # 空位提示：还有名额时可继续提案（满员后新提案会顶掉最旧的一条）
+        try:
+            free = max(0, int(vote.get("max_options") or 6) - len(opts or []))
+        except (TypeError, ValueError):
+            free = 0
+        if free > 0:
+            foot_lines.append(f"还可提案 {free} 个：种子提案 <序号> 1+2+3")
     else:
         rule_lines.append(f"获胜组合：{winner_name}")
         if vote.get("tie_random"):
@@ -424,7 +432,9 @@ def render_vote_card(out_png, vote, tally, status="open", bg_dir=None, bg_file=N
         draw.text((r["pct_x"], r["bar_y"] + px(BAR_H) // 2), r["pct_text"],
                   font=pct_font, fill=PCT_COLOR, anchor="lm")
 
-    img.convert("RGB").save(out_png, "PNG")
+    # 输出 JPEG：png 有 2MB 左右，发图慢；jpeg 约 1/5 体积且肉眼看不出差别
+    img.convert("RGB").save(out_png, "JPEG", quality=int(jpeg_quality),
+                            optimize=True, progressive=True)
     return out_png
 
 
