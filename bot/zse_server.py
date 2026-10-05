@@ -744,7 +744,7 @@ class ZseServer:
         return await self._request_plugin(server_code, "auto_reset", payload, timeout)
 
     async def request_archive_export(self, server_code: str, timeout: float = 300.0,
-                                     action: str = ""):
+                                     action: str = "", file: str = ""):
         """存档导出请求（打包较慢，默认 300 秒超时）。返回 (ok, data)：data 含 name/size/base64
 
         action="backup" → 插件只把 zip 落到服务器备份目录、不回传 base64（省编码与流量）；
@@ -752,6 +752,8 @@ class ZseServer:
         插件返回的 size 是 zip 字节数（备份指令用来显示大小）。
         """
         payload = {"action": action} if action else {}
+        if file:
+            payload["file"] = file
         return await self._request_plugin(server_code, "archive_export", payload, timeout)
 
     async def request_world_settings(self, server_code: str, action: str = "get",

@@ -109,7 +109,7 @@ from permissions import (
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_EXEC,
     PERM_MAP_FETCH, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW, PERM_ROLE_MANAGE,
     PERM_BROADCAST, PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET, PERM_VOTE_PROPOSAL_DEL,
-PERM_BACKUP, PERM_WORLD_SETTINGS,
+PERM_BACKUP, PERM_WORLD_SETTINGS, PERM_BACKUP_RESTORE,
     PERM_PROGRESS_NOTIFY, PERM_SAY_ALL, PERM_STATUS_NOTIFY, 
 )
 from github_monitor import (
@@ -756,6 +756,14 @@ class GroupReviewClient(botpy.Client):
         # startswith("投票") 不会把「种子投票」「结束投票」误落到「投票」处理器。
         if low.startswith("世界设置"):  # 世界设置 <序号> [难度/大小/邪恶 值…]（改设置需管理员+）
             await self.cmd_world_settings(message, text, gid, user_openid)
+            return
+        if low.startswith("备份列表") or low.startswith("备份 列表"):  # 备份列表 <序号>
+            await self.cmd_backup_list(message, text, gid)
+            return
+        if low.startswith("回退备份") or low.startswith("还原备份"):  # 回退备份 <序号> <备份编号>（服主及以上）
+            if not await self._perm_ok(message, gid, user_openid, PERM_BACKUP_RESTORE, "回退备份"):
+                return
+            await self.cmd_backup_restore(message, text, gid)
             return
         if low.startswith("备份") and not low.startswith("备份状态"):  # 备份 [发送] <序号>（管理员及以上）
             if not await self._perm_ok(message, gid, user_openid, PERM_BACKUP, "备份"):
@@ -3180,6 +3188,109 @@ class GroupReviewClient(botpy.Client):
             f"- 存档推送：成功 {ok_cnt}/{len(targets)} 个群\n"
             f"- 存档文件：`{zip_name}`" + closed_note + self._vote_failed_line(failed))
 
+    async def cmd_backup_list(self, message, text: str, gid, user_openid: str = ""):
+        """备份列表 [序号]：列出服务器上的备份（编号/时间/大小），编号供 回退备份 使用"""
+        title = self.build_card_title("备份列表")
+        rest = text[len("备份列表"):].lstrip("：: \t").strip()
+        if rest.startswith("列表"):
+            rest = rest[len("列表"):].strip()
+        seq, _tail = parse_server_index(rest)
+        seq = seq or 1
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
+            return
+        ok, data = await self.zse_server.request_archive_export(
+            server_code, action="list", timeout=60)
+        if not ok or not isinstance(data, dict) or data.get("error"):
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 读取备份列表失败喵...**", "",
+                f"> 原因：{self._reason_of(data)}",
+                "> 若提示不支持的包类型，请让服主更新 starZSEbot 插件",
+            ]))
+            return
+        items = data.get("items") or []
+        if not items:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**还没有任何备份喵...**", "",
+                "> 插件会每 30 分钟自动备份一次（配置项：自动备份间隔小时 / 备份保留份数）",
+            ]))
+            return
+        lines = [title, "", f"**共 {len(items)} 份备份**（新 → 旧）", ""]
+        for it in items[:25]:
+            size = float(it.get("size") or 0) / 1024 / 1024
+            lines.append(f"- `{int(it.get('no') or 0):>2}`  {it.get('time')}  ·  {size:.1f} MB")
+        if len(items) > 25:
+            lines.append(f"> 仅显示最近 25 份（共 {len(items)} 份）")
+        lines += ["", f"> 回退：`回退备份 {seq} <编号>`（服主+，会把备份里的玩家存档导入覆盖）",
+                  "> 自动备份：默认每 30 分钟一次"]
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def cmd_backup_restore(self, message, text: str, gid, user_openid: str = ""):
+        """回退备份 <序号> <备份编号>：把该备份里的玩家存档重新导入覆盖（服主及以上）"""
+        title = self.build_card_title("回退备份")
+        cmd = "回退备份" if "回退备份" in text else "还原备份"
+        rest = text[len(cmd):].lstrip("：: \t").strip()
+        seq, tail = parse_server_index(rest)
+        toks = (tail or "").split()
+        no = int(toks[0]) if toks and toks[0].isdigit() else None
+        if seq is None or no is None:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**格式：** `回退备份 <服务器序号> <备份编号>`", "",
+                "> 备份编号见 `备份列表 <序号>`",
+                "> 例：`回退备份 1 3`（把第 3 份备份里的玩家存档导入覆盖）",
+            ]))
+            return
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
+            return
+        ok, data = await self.zse_server.request_archive_export(
+            server_code, action="list", timeout=60)
+        items = (data or {}).get("items") if isinstance(data, dict) else None
+        if not ok or not items:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 读取备份列表失败喵...**",
+                f"> 原因：{self._reason_of(data)}",
+            ]))
+            return
+        target = next((it for it in items if int(it.get("no") or -1) == no), None)
+        if target is None:
+            await self._reply_markdown(message, "\n".join([
+                title, "", f"**❌ 没有编号 {no} 的备份喵...**",
+                f"> 当前共 {len(items)} 份，用 `备份列表 {seq}` 查看编号",
+            ]))
+            return
+        ok2, d2 = await self.zse_server.request_archive_export(
+            server_code, action="restore", file=target.get("name") or "", timeout=300)
+        if not ok2 or not isinstance(d2, dict) or d2.get("error"):
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 回退失败喵...**", "",
+                f"> 备份：`{target.get('name')}`",
+                f"> 原因：{self._reason_of(d2)}",
+            ]))
+            return
+        restored = d2.get("restored") or []
+        skipped = d2.get("skipped") or []
+        lines = [title, "", "**✅ 回退完成**", "",
+                 f"- 备份：`{d2.get('file') or target.get('name')}`  （{target.get('time')}）",
+                 f"- 成功导入：**{len(restored)}** 个玩家存档"]
+        if restored:
+            show = "、".join(str(x) for x in restored[:10])
+            lines.append(f"  > {show}" + ("…" if len(restored) > 10 else ""))
+        lines.append(f"- 跳过：{len(skipped)} 个" + (f"（{'、'.join(str(x) for x in skipped[:6])}…）" if skipped else ""))
+        lines += ["", "> 相关在线玩家已被踢下线；重新登录后即为备份里的存档",
+                  "> 若数据看着没变，请确认没有别人随后又保存了角色"]
+        await self._reply_markdown(message, "\n".join(lines))
+
     async def cmd_world_settings(self, message, text: str, gid, user_openid: str = ""):
         """世界设置 <序号> [难度 经典|专家|大师|旅行] [大小 小|中|大] [邪恶 腐化|猩红]
 
@@ -3192,11 +3303,11 @@ class GroupReviewClient(botpy.Client):
         seq, tail = parse_server_index(rest)
         if seq is None:
             await self._reply_markdown(message, "\n".join([
-                title, "", "**格式：** `世界设置 <服务器序号> [难度 值] [大小 值] [邪恶 值]`", "",
+                title, "", "**格式：** `世界设置 <服务器序号> [难度] [世界大小] [邪恶]`", "",
                 "> 查看：`世界设置 1`",
-                "> 修改：`世界设置 1 难度 大师 大小 大 邪恶 猩红`（管理员+）",
+                "> 修改：`世界设置 1 大师 大 猩红`（管理员+，顺序＝难度/大小/邪恶，只写前几项也行）",
                 "> 取值：难度 `经典/专家/大师/旅行`；大小 `小/中/大`；邪恶 `腐化/猩红`",
-                "> 恢复跟随当前世界：值填 `跟随`（或 默认/清除）",
+                "> 恢复跟随当前世界：对应位置填 `跟随`",
             ]))
             return
         rec = self._vote_server(gid, seq)
@@ -3212,26 +3323,34 @@ class GroupReviewClient(botpy.Client):
                   "邪恶": "evil", "环境": "evil", "邪恶环境": "evil", "邪恶地形": "evil"}
         pairs = {}
         if toks:
-            i = 0
-            while i < len(toks):
-                key = keymap.get(toks[i])
-                if key is None or i + 1 >= len(toks):
+            if toks[0] in keymap:
+                # 键值式（也支持）：世界设置 1 难度 大师 大小 大 邪恶 猩红
+                i = 0
+                while i < len(toks):
+                    key = keymap.get(toks[i])
+                    if key is None or i + 1 >= len(toks):
+                        await self._reply_markdown(message, "\n".join([
+                            title, "", "**❌ 参数格式不对喵...**", "",
+                            "> 格式：`世界设置 <序号> [难度] [世界大小] [邪恶]`",
+                            "> 例：`世界设置 1 大师 大 猩红`",
+                        ]))
+                        return
+                    val = toks[i + 1]
+                    pairs[key] = "" if val in ("跟随", "默认", "清除", "不变", "默认值") else val
+                    i += 2
+            else:
+                # 位置式（推荐）：世界设置 1 大师 大 猩红 = 难度 / 世界大小 / 邪恶（可只写前几项）
+                for key, val in zip(("difficulty", "size", "evil"), toks[:3]):
+                    pairs[key] = "" if val in ("跟随", "默认", "清除", "不变", "默认值", "-") else val
+                if len(toks) > 3:
                     await self._reply_markdown(message, "\n".join([
-                        title, "", "**❌ 参数格式不对喵...**", "",
-                        "> 格式：`世界设置 <序号> [难度 值] [大小 值] [邪恶 值]`",
-                        "> 例：`世界设置 1 难度 大师 大小 大 邪恶 猩红`",
+                        title, "", "**❌ 参数太多了喵...**", "",
+                        "> `世界设置 <序号> [难度] [世界大小] [邪恶]`",
+                        "> 例：`世界设置 1 大师 大 猩红`（只写前两项也行）",
                     ]))
                     return
-                val = toks[i + 1]
-                pairs[key] = "" if val in ("跟随", "默认", "清除", "不变", "默认值") else val
-                i += 2
             if not await self._perm_ok(message, gid, user_openid, PERM_WORLD_SETTINGS, "世界设置"):
                 return
-        ok, data = await self.zse_server.request_world_settings(
-            server_code, action=("set" if pairs else "get"),
-            difficulty=pairs.get("difficulty", ""), size=pairs.get("size", ""),
-            evil=pairs.get("evil", ""))
-        if not ok or not isinstance(data, dict):
             await self._reply_markdown(message, "\n".join([
                 title, "", "**❌ 读取/保存世界设置失败喵...**", "",
                 f"> 原因：{self._reason_of(data)}",
@@ -3258,8 +3377,8 @@ class GroupReviewClient(botpy.Client):
         for label, key in (("难度", "set_difficulty"), ("世界大小", "set_size"), ("邪恶环境", "set_evil")):
             val = str(data.get(key) or "").strip()
             lines.append(f"- {label}：**{_md_safe(val)}**" if val else f"- {label}：跟随当前世界")
-        lines += ["", "> 修改：`世界设置 %d 难度 大师 大小 大 邪恶 猩红`" % seq,
-                  "> 恢复跟随：值填 `跟随`"]
+        lines += ["", "> 修改：`世界设置 %d 大师 大 猩红`（顺序＝难度/大小/邪恶）" % seq,
+                  "> 恢复跟随：对应位置填 `跟随`"]
         await self._reply_markdown(message, "\n".join(lines))
 
     async def cmd_backup(self, message, text: str, gid, user_openid: str = ""):

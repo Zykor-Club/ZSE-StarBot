@@ -14,7 +14,7 @@ from permissions import (
     PERM_ROLE_MANAGE, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW,
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_MAP_FETCH, PERM_SAY_ALL, PERM_EXEC, PERM_BROADCAST,
     PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET, PERM_PROGRESS_NOTIFY, PERM_STATUS_NOTIFY,
-    PERM_VOTE_PROPOSAL_DEL, PERM_BACKUP, PERM_WORLD_SETTINGS,
+    PERM_VOTE_PROPOSAL_DEL, PERM_BACKUP, PERM_WORLD_SETTINGS, PERM_BACKUP_RESTORE,
 )
 
 # ───────────────────────── 分类与指令 ─────────────────────────
@@ -79,6 +79,8 @@ CATEGORIES = [
             ("删除提案", "<序号> <投票卡编号>", "", PERM_VOTE_PROPOSAL_DEL, "管理员删除任意提案（含机器人随机项）"),
             ("世界设置", "<序号> [难度/大小/邪恶 值…]", "", PERM_WORLD_SETTINGS, "查看/修改世界生成参数，重置时生效"),
             ("备份", "[发送] <序号>", "", PERM_BACKUP, "把存档打包备份到服务器（加“发送”同时传到本群）"),
+            ("备份列表", "[序号]", "", None, "列出服务器上的备份（每 30 分钟自动备份一次）"),
+            ("回退备份", "<序号> <备份编号>", "", PERM_BACKUP_RESTORE, "把备份里的玩家存档导入覆盖（服主+）"),
             ("重置", "[序号]", "", PERM_RESET, "导出存档 → 应用种子 → 重置世界 → 推送存档"),
         ],
     },
