@@ -109,7 +109,7 @@ from permissions import (
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_EXEC,
     PERM_MAP_FETCH, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW, PERM_ROLE_MANAGE,
     PERM_BROADCAST, PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET, PERM_VOTE_PROPOSAL_DEL,
-PERM_BACKUP,
+PERM_BACKUP, PERM_WORLD_SETTINGS,
     PERM_PROGRESS_NOTIFY, PERM_SAY_ALL, PERM_STATUS_NOTIFY, 
 )
 from github_monitor import (
@@ -754,6 +754,9 @@ class GroupReviewClient(botpy.Client):
         # ── 种子投票 / 投票 / 结束投票 / 重置（AutoResetPlus 接入，见 spec add-seed-vote-reset）──
         # 分发顺序证据：「种子投票」「结束投票」先于「投票」判断；且二者均不以"投票"开头，
         # startswith("投票") 不会把「种子投票」「结束投票」误落到「投票」处理器。
+        if low.startswith("世界设置"):  # 世界设置 <序号> [难度/大小/邪恶 值…]（改设置需管理员+）
+            await self.cmd_world_settings(message, text, gid, user_openid)
+            return
         if low.startswith("备份") and not low.startswith("备份状态"):  # 备份 [发送] <序号>（管理员及以上）
             if not await self._perm_ok(message, gid, user_openid, PERM_BACKUP, "备份"):
                 return
@@ -3176,6 +3179,88 @@ class GroupReviewClient(botpy.Client):
             f"- 种子来源：{seed_source}\n"
             f"- 存档推送：成功 {ok_cnt}/{len(targets)} 个群\n"
             f"- 存档文件：`{zip_name}`" + closed_note + self._vote_failed_line(failed))
+
+    async def cmd_world_settings(self, message, text: str, gid, user_openid: str = ""):
+        """世界设置 <序号> [难度 经典|专家|大师|旅行] [大小 小|中|大] [邪恶 腐化|猩红]
+
+        · 只给序号 → 展示当前世界参数 + 下次重置将使用的设置（所有人可看）
+        · 带参数 → 保存设置（管理员及以上），**重置生成新世界时生效**（种子投票出来的世界也按它）
+        · 值与"跟随"（或 默认/清除）→ 恢复为跟随当前世界
+        """
+        title = self.build_card_title("世界设置")
+        rest = text[len("世界设置"):].lstrip("：: \t").strip()
+        seq, tail = parse_server_index(rest)
+        if seq is None:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**格式：** `世界设置 <服务器序号> [难度 值] [大小 值] [邪恶 值]`", "",
+                "> 查看：`世界设置 1`",
+                "> 修改：`世界设置 1 难度 大师 大小 大 邪恶 猩红`（管理员+）",
+                "> 取值：难度 `经典/专家/大师/旅行`；大小 `小/中/大`；邪恶 `腐化/猩红`",
+                "> 恢复跟随当前世界：值填 `跟随`（或 默认/清除）",
+            ]))
+            return
+        rec = self._vote_server(gid, seq)
+        if rec is None:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
+            return
+        server_code = self._vote_server_code(rec)
+        if not server_code:
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
+            return
+        toks = (tail or "").split()
+        keymap = {"难度": "difficulty", "大小": "size", "世界大小": "size", "尺寸": "size",
+                  "邪恶": "evil", "环境": "evil", "邪恶环境": "evil", "邪恶地形": "evil"}
+        pairs = {}
+        if toks:
+            i = 0
+            while i < len(toks):
+                key = keymap.get(toks[i])
+                if key is None or i + 1 >= len(toks):
+                    await self._reply_markdown(message, "\n".join([
+                        title, "", "**❌ 参数格式不对喵...**", "",
+                        "> 格式：`世界设置 <序号> [难度 值] [大小 值] [邪恶 值]`",
+                        "> 例：`世界设置 1 难度 大师 大小 大 邪恶 猩红`",
+                    ]))
+                    return
+                val = toks[i + 1]
+                pairs[key] = "" if val in ("跟随", "默认", "清除", "不变", "默认值") else val
+                i += 2
+            if not await self._perm_ok(message, gid, user_openid, PERM_WORLD_SETTINGS, "世界设置"):
+                return
+        ok, data = await self.zse_server.request_world_settings(
+            server_code, action=("set" if pairs else "get"),
+            difficulty=pairs.get("difficulty", ""), size=pairs.get("size", ""),
+            evil=pairs.get("evil", ""))
+        if not ok or not isinstance(data, dict):
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**❌ 读取/保存世界设置失败喵...**", "",
+                f"> 原因：{self._reason_of(data)}",
+                "> 若提示不支持的包类型，请让服主更新 starZSEbot 插件",
+            ]))
+            return
+        if data.get("error"):
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {data.get('error')}**"]))
+            return
+        lines = [title, ""]
+        if pairs:
+            lines += ["**✅ 地图设置已保存（下次重置生成新世界时生效）**", ""]
+        lines += [
+            f"**当前世界**：{data.get('world_name') or '—'}",
+            f"- 难度：**{data.get('difficulty') or '—'}**",
+            f"- 世界大小：**{data.get('size') or '—'}**（{data.get('max_x') or '?'}×{data.get('max_y') or '?'}）",
+            f"- 邪恶环境：**{data.get('evil') or '—'}**",
+        ]
+        seed = str(data.get("text_seed") or data.get("seed") or "").strip()
+        if seed:
+            lines.append(f"- 当前种子：`{_md_safe(seed)}`")
+        lines.append(f"- 困难模式：{'是' if data.get('hardmode') else '否'}")
+        lines += ["", "**下次重置将使用**（种子投票获胜时也一样，只有种子由投票决定）"]
+        for label, key in (("难度", "set_difficulty"), ("世界大小", "set_size"), ("邪恶环境", "set_evil")):
+            val = str(data.get(key) or "").strip()
+            lines.append(f"- {label}：**{_md_safe(val)}**" if val else f"- {label}：跟随当前世界")
+        lines += ["", "> 修改：`世界设置 %d 难度 大师 大小 大 邪恶 猩红`" % seq,
+                  "> 恢复跟随：值填 `跟随`"]
+        await self._reply_markdown(message, "\n".join(lines))
 
     async def cmd_backup(self, message, text: str, gid, user_openid: str = ""):
         """备份 [发送] <序号>：把存档打包备份到服务器（加"发送"则额外把 zip 推到本群）"""

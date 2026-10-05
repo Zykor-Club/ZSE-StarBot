@@ -754,6 +754,20 @@ class ZseServer:
         payload = {"action": action} if action else {}
         return await self._request_plugin(server_code, "archive_export", payload, timeout)
 
+    async def request_world_settings(self, server_code: str, action: str = "get",
+                                     difficulty: str = "", size: str = "", evil: str = "",
+                                     timeout: float = 20.0):
+        """世界设置（难度/世界大小/邪恶环境）：action="get" 读，action="set" 保存。
+
+        返回 (ok, data)：data 含 difficulty/size/evil（当前世界）、max_x/max_y/seed/
+        text_seed/hardmode/world_name，以及 set_*（配置里"下次重置用"的值，空=跟随当前）。
+        这些设置由插件在**重置生成新世界前**应用 → 投票出种子后的新世界默认也按它生成。
+        """
+        payload = {"action": action}
+        if action == "set":
+            payload.update({"difficulty": difficulty, "size": size, "evil": evil})
+        return await self._request_plugin(server_code, "world_settings", payload, timeout)
+
     async def request_progress(self, server_code: str, timeout: float = 15.0):
         """进度查询请求（boss 击杀情况）。返回 (ok, data)"""
         return await self._request_plugin(server_code, "progress", {}, timeout)
