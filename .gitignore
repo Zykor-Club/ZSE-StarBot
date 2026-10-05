@@ -6,6 +6,7 @@ deploy_config.json
 服务器部署指南.md
 
 # ===== 运行时数据 =====
+permissions.json
 *.log
 pending.json
 whitelist.json
