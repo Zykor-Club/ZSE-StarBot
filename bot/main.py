@@ -3214,6 +3214,8 @@ class GroupReviewClient(botpy.Client):
             ]))
             return
         items = data.get("items") or []
+        _log.info("备份列表请求 server=%s 返回 keys=%s items=%d",
+                  (server_code or "")[:8], list((data or {}).keys()), len(items))
         if not items:
             await self._reply_markdown(message, "\n".join([
                 title, "", "**还没有任何备份喵...**", "",
