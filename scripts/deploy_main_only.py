@@ -22,9 +22,10 @@ cli.connect(CFG["host"], port=CFG["port"], username=CFG["user"],
 
 sftp = cli.open_sftp()
 for f in ["main.py", "permissions.py", "whitelist_mail.py", "zse_server.py", "groups_registry.py",
-          "config.yaml", "lookbag_render.py", "upload_media.py", "vote_store.py", "vote_render.py",
+          "config.yaml", "lookbag_render.py", "upload_media.py", "vote_store.py", "server_status_store.py", "vote_render.py",
           "progress_render.py", "progress_notify_store.py", "progress_unlock_store.py",
-          "github_monitor.py", "card_render.py"]:
+          "github_monitor.py", "card_render.py", "help_content.py", "rank_render.py",
+          "lexicon.py", "lexicon_render.py", "seeds.py", "seed_render.py"]:
     sftp.put(os.path.join(BOT_DIR, f), "C:/bot/" + f)
     print("上传 OK:", f)
 sftp.close()

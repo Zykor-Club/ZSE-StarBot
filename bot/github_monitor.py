@@ -31,9 +31,14 @@ def _headers(star_accept: bool = False) -> dict:
     return h
 
 
+# 单次请求超时：GitHub 偶发不可达时不能让监控循环一直挂着（调用方会话未必设了超时）
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=8)
+
+
 async def _fetch(session: aiohttp.ClientSession, path: str, params=None, star_accept: bool = False):
     url = f"{API_BASE}{path}"
-    async with session.get(url, params=params, headers=_headers(star_accept)) as r:
+    async with session.get(url, params=params, headers=_headers(star_accept),
+                           timeout=_REQUEST_TIMEOUT) as r:
         if r.status == 200:
             return await r.json()
         text = await r.text()

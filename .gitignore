@@ -27,6 +27,10 @@ github-bot-deploy.zip
 __pycache__/
 *.py[cod]
 
+# ===== 抓取缓存（可重新生成，体积大）=====
+_wiki_cache.json
+scripts/_wiki_cache.json
+
 # ===== 临时 / 一次性诊断文件 =====
 tmp_diag/
 _chunk.b64_part

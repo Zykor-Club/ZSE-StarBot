@@ -168,6 +168,7 @@ class ProgressUnlockStore:
         now = int(time.time())
         with self._lock:
             changed = False
+            ts_changed = False
             for entries in self._data.values():
                 for e in entries:
                     if e.get("server_code") != server_code:
@@ -180,7 +181,12 @@ class ProgressUnlockStore:
                         ts = 0
                     if ts > 0 and ts != int(e.get("last_ts") or 0):
                         e["last_ts"] = ts
-            if changed:
+                        ts_changed = True
+            # last_sync 只作诊断：解锁时间戳没变时最多每 10 分钟落一次盘，
+            # 否则服务器在线期间会每 60 秒全量重写 progress_unlocks.json
+            last_saved = int(getattr(self, "_last_sync_saved", 0) or 0)
+            if changed and (ts_changed or now - last_saved >= 600):
+                self._last_sync_saved = now
                 self._save_locked()
 
     def mark_fired(self, gid: str, server_code: str, boss_key: str, ts: int):

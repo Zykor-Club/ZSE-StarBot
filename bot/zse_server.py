@@ -54,6 +54,27 @@ def decode_archive_zip(compressed_b64: str) -> bytes:
     return base64.b64decode(inner_b64)
 
 
+_TOKEN_MAX_FAILS = 20   # /server/token 每 IP 每分钟允许的失败次数（绑定码 6 位，必须限流）
+
+
+def make_ssl_context(cert_file: str, key_file: str):
+    """用证书+私钥构造 TLS 上下文（供插件通道走 wss）。
+
+    证书用 Let's Encrypt 正式证书时，插件侧默认校验即可通过、服主零配置。
+    调用方负责确认两个文件存在；缺证书时不要调用本函数（保持明文 ws）。
+    """
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert_file, key_file)
+    return ctx
+
+
+def decode_compressed_b64(compressed_b64: str) -> bytes:
+    """插件通用文件回包 base64 = gzip(base64(原始字节))；还原出原始字节（世界文件 .wld / 小地图 .map）"""
+    inner_b64 = gzip.decompress(base64.b64decode(compressed_b64)).decode("utf-8")
+    return base64.b64decode(inner_b64)
+
+
 class ZseServer:
     """starZSEbot 协议服务端，与 QQ 机器人 main.py 共用同一个事件循环"""
 
@@ -70,6 +91,8 @@ class ZseServer:
         self._ws_by_token: dict = {}
         # request_id -> asyncio.Future    在线查询挂起的应答
         self._pending: dict = {}
+        # 每 IP 的 /server/token 失败时间戳（防绑定码爆破）
+        self._token_fails: dict = {}
         # 白名单数据（进服判定用）
         self.whitelist = whitelist or WhitelistStore()
         # 待批准的设备登录请求（need_login 时记录，群里"登录"命令批准）
@@ -162,7 +185,11 @@ class ZseServer:
         token = target.get("token")
         ws = self._ws_by_token.get(token) if token else None
         if ws is not None and not ws.closed:
-            await self._send_unbind(ws, f"管理员在群里删除了该服务器")
+            try:
+                await self._send_unbind(ws, f"管理员在群里删除了该服务器")
+            except Exception as e:
+                # 半开连接上 send_str 可能抛 OSError：不能因此中断删除流程（否则记录留盘且群里无回执）
+                print(f"[starZSEbot-server] 解绑通知发送失败（继续删除）: {e}")
         records.remove(target)
         for i, r in enumerate(records, 1):
             r["seq"] = i
@@ -176,6 +203,28 @@ class ZseServer:
         """服务器列表：返回本群拥有的服务器（owner_gid==gid 的记录）。[{seq, ip, port, bound, online, server_name, whitelist}]"""
         gid = gid or "nogroup"
         return [r for r in self._data.get(gid, []) if r.get("owner_gid") == gid]
+
+    def all_records(self) -> list:
+        """所有群的服务器记录（上/下线通知需要遍历全部）"""
+        out = []
+        for records in self._data.values():
+            if isinstance(records, list):
+                out.extend(r for r in records if isinstance(r, dict))
+        return out
+
+    def is_alive(self, rec: dict, stale_after: float = 180.0) -> bool:
+        """是否真的在线：WS 标记在线且心跳未过期（插件每 60 秒心跳一次）
+
+        只看 rec["online"] 不够：插件崩溃/断网时 WS 可能还没被判定关闭，
+        心跳停止超过 stale_after 即视为掉线，避免「假在线」。
+        """
+        if not rec or not rec.get("online"):
+            return False
+        try:
+            hb = float(rec.get("heartbeat_at") or 0)
+        except (TypeError, ValueError):
+            hb = 0.0
+        return bool(hb) and (time.time() - hb) < stale_after
 
     def visible_records(self, gid: str):
         """本群可见的服务器：本群拥有的 + 同一联合区内其它群的全部服务器（网状可见，无需共享授权）。
@@ -346,11 +395,25 @@ class ZseServer:
         return app
 
     async def _handle_token(self, request: web.Request):
-        """插件轮询：GET /server/token/{code} -> {token, group_open_id}"""
+        """插件轮询：GET /server/token/{code} -> {token, group_open_id}
+
+        安全约束（2026-10-04 加固）：
+          · 绑定码只有 6 位，必须限流防爆破 → 每 IP 每分钟最多 _TOKEN_MAX_FAILS 次「未登记」尝试，超限 429；
+          · 绑定码在**首次成功建立 WS 连接时立即作废**（见 _handle_ws），因此它不再是「永久取 token 的凭证」。
+        """
         code = request.match_info["code"]
+        peer = request.transport.get_extra_info("peername") if request.transport else None
+        ip = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip() \
+            or (peer[0] if peer else "") or "?"
+        now = time.time()
+        hits = [t for t in self._token_fails.get(ip, []) if now - t < 60]
+        self._token_fails[ip] = hits
+        if len(hits) >= _TOKEN_MAX_FAILS:
+            return web.json_response({"error": "尝试过于频繁，请稍后再试"}, status=429)
         gid, rec = self._find_by_code(code)
         if rec is None:
-            return web.json_response({"error": "绑定码未登记"}, status=404)
+            hits.append(now)
+            return web.json_response({"error": "绑定码未登记或已使用"}, status=404)
         if not rec.get("token"):
             rec["token"] = secrets.token_urlsafe(32)
             self._by_token[rec["token"]] = (gid, rec)
@@ -370,11 +433,26 @@ class ZseServer:
             await ws.close(code=4003, message="认证失败，请重新绑定")
             return ws
 
+        # 同 token 只允许一条连接：新连接到来先关掉旧连接，避免「顶掉真插件」后
+        # 机器人把白名单回包发给攻击者、真插件收不到结果而被超时踢出
+        old = self._ws_by_token.get(token)
+        if old is not None and not old.closed and old is not ws:
+            try:
+                await old.close(code=4004, message="同一服务器的另一条连接已建立")
+            except Exception as e:
+                print(f"[starZSEbot-server] 关闭旧连接失败: {e}")
         # 大地图回包可能远超默认 4MB，放宽到 128MB
         ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=128 * 1024 * 1024)
         await ws.prepare(request)
         self._ws_by_token[token] = ws
         rec = entry[1]
+        # 绑定完成：绑定码标记为「已使用」（一次性，之后再也换不出 token），
+        # 但**保留 code 原值**——它是投票/进度提醒/状态通知等业务数据里的服务器唯一标识，
+        # 清空会让这些数据全部落到空串上（历史回归，勿再改成清空）。
+        if rec.get("code") and not rec.get("code_used"):
+            print(f"[starZSEbot-server] 服务器已绑定，绑定码 {rec['code']} 标记为已使用")
+            rec["code_used"] = True
+            await self._save()
         rec["online"] = True
         rec["heartbeat_at"] = time.time()
         print(f"[starZSEbot-server] 插件已连接: {rec['ip']}:{rec['port']} (群 {gid[:8]}...)")
@@ -416,7 +494,8 @@ class ZseServer:
             rec["online"] = True
         elif ptype == "whitelist":
             # 玩家进服：插件发来玩家信息，BOT 判定白名单结果并回包
-            await self._handle_whitelist(rec, payload, ws)
+            # 带上请求侧 request_id 一并回声：插件据此确认"这条裁定对应本次握手"，伪造/重放的回包可被它丢弃
+            await self._handle_whitelist(rec, payload, ws, pkg.get("request_id"))
         elif ptype == "progress_notify":
             # 插件主动推送：某 boss 本世界首次被击杀 → 交由 main.py 播报到订阅群
             cb = self.on_progress_notify
@@ -427,11 +506,12 @@ class ZseServer:
                     except Exception as e:
                         print(f"[starZSEbot-server] 进度播报处理异常: {e}")
                 asyncio.create_task(_fire_notify())
-        elif ptype in ("player_list", "progress", "map_image", "call_command", "look_bag",
-                       "auto_reset", "archive_export"):
-            # 插件对在线/地图/背包/种子配置/存档导出等请求的应答（应答包带同样的 request_id 与 is_request）
+        elif pkg.get("request_id"):
+            # 插件对请求的应答（应答包带同样的 request_id）：按 id 匹配 pending future。
+            # 不再维护「应答类型白名单」——白名单曾漏掉 rank_data / plugin_list / world_file /
+            # map_file，插件回包被静默丢弃，请求方只能等到超时；按 request_id 匹配后新增类型自动覆盖。
             req_id = pkg.get("request_id")
-            fut = self._pending.get(req_id) if req_id else None
+            fut = self._pending.get(req_id)
             if fut and not fut.done():
                 if ptype in ("player_list", "map_image"):
                     rec["server_name"] = payload.get("server_name", rec.get("server_name", ""))
@@ -493,7 +573,8 @@ class ZseServer:
         }))
 
     # ───────────────────────── 白名单进服判定 ─────────────────────────
-    async def _handle_whitelist(self, rec: dict, payload: dict, ws: web.WebSocketResponse):
+    async def _handle_whitelist(self, rec: dict, payload: dict, ws: web.WebSocketResponse,
+                               req_id: str = None):
         """玩家进服白名单判定。插件发 {player_name, player_ip, player_uuid, player_platform}，BOT 回 whitelist_result。
         联合区数据归总群：判定只用服务器归属群所在的【总群】白名单（effective_gid）。
         need_login 待批准记录写入总群，玩家在总群/任一联合群发"登录"可批准（一步批准）。"""
@@ -503,7 +584,7 @@ class ZseServer:
             player_ip = (payload.get("player_ip") or "").strip()
             player_platform = (payload.get("player_platform") or "").strip()
             if not player_name:
-                await self._send_whitelist(ws, "", "unknown")
+                await self._send_whitelist(ws, "", "unknown", req_id)
                 return
             owner = rec.get("owner_gid") or ""
             eff_gid = self.registry.effective_gid(owner) if self.registry else owner
@@ -531,19 +612,20 @@ class ZseServer:
 
                     asyncio.create_task(_fire_login_cb())
             print(f"[starZSEbot-server] 白名单判定: {player_name} -> {result}({reason}) 平台 {player_platform or '-'} 城市 {city or '-'} (归属群 {owner[:8]}.../总群 {eff_gid[:8]}...)")
-            await self._send_whitelist(ws, player_name, result)
+            await self._send_whitelist(ws, player_name, result, req_id)
         except Exception as e:
             print(f"[starZSEbot-server] 白名单判定异常: {e}")
-            await self._send_whitelist(ws, payload.get("player_name") or "", "unknown")
+            await self._send_whitelist(ws, payload.get("player_name") or "", "unknown", req_id)
 
     @staticmethod
-    async def _send_whitelist(ws: web.WebSocketResponse, player_name: str, result: str):
+    async def _send_whitelist(ws: web.WebSocketResponse, player_name: str, result: str,
+                              req_id: str = None):
         await ws.send_str(json.dumps({
             "version": "0.1.0",
             "direction": "to_server",
             "type": "whitelist",
             "is_request": False,
-            "request_id": None,
+            "request_id": req_id,   # 回声插件请求的 id（None 时兼容旧插件）
             "payload": {
                 "player_name": player_name,
                 "whitelist_result": result,
@@ -661,18 +743,95 @@ class ZseServer:
             payload["seed"] = seed
         return await self._request_plugin(server_code, "auto_reset", payload, timeout)
 
-    async def request_archive_export(self, server_code: str, timeout: float = 300.0):
-        """存档导出请求（打包较慢，默认 300 秒超时）。返回 (ok, data)"""
-        return await self._request_plugin(server_code, "archive_export", {}, timeout)
+    async def request_archive_export(self, server_code: str, timeout: float = 300.0,
+                                     action: str = ""):
+        """存档导出请求（打包较慢，默认 300 秒超时）。返回 (ok, data)：data 含 name/size/base64
+
+        action="backup" → 插件只把 zip 落到服务器备份目录、不回传 base64（省编码与流量）；
+        缺省 → 导出并把 zip 一起回传（重置流程要把存档发到群里）。
+        插件返回的 size 是 zip 字节数（备份指令用来显示大小）。
+        """
+        payload = {"action": action} if action else {}
+        return await self._request_plugin(server_code, "archive_export", payload, timeout)
 
     async def request_progress(self, server_code: str, timeout: float = 15.0):
         """进度查询请求（boss 击杀情况）。返回 (ok, data)"""
         return await self._request_plugin(server_code, "progress", {}, timeout)
 
+    # ───────────────────────── 插件列表 / 排行 / 世界与地图文件 / 自踢 ─────────────────────────
+    async def request_plugin_list(self, server_code: str, timeout: float = 15.0):
+        """插件列表请求。返回 (ok, data)：data = {"is_mod": bool, "plugins": [{Name,Author,Description,Version}]}"""
+        return await self._request_plugin(server_code, "plugin_list", {}, timeout)
+
+    async def request_rank(self, server_code: str, rank_type: str = "", arg: str = "",
+                           timeout: float = 20.0):
+        """排行榜请求。返回 (ok, data)：data 含 rank_type_support / need_arg / arg_support /
+        message / support_args / support_rank_types / rank（{"title","rank_lines":{名:值}}）"""
+        return await self._request_plugin(
+            server_code, "rank_data",
+            {"rank_type": rank_type or "", "arg": arg or ""}, timeout)
+
+    async def request_world_file(self, server_code: str, timeout: float = 180.0):
+        """世界文件（.wld）请求：包体较大，超时放宽。返回 (ok, data)：data = {"name","base64"}"""
+        return await self._request_plugin(server_code, "world_file", {}, timeout)
+
+    async def request_map_file(self, server_code: str, timeout: float = 180.0):
+        """小地图文件（.map，需 GenerateMap 插件）。返回 (ok, data)：data = {"name","base64"}"""
+        return await self._request_plugin(server_code, "map_file", {}, timeout)
+
+    async def send_self_kick(self, gid: str, player_name: str) -> int:
+        """向本群可见的在线服务器广播 self_kick（插件不回包）。返回成功发出的服务器数。
+
+        插件侧只在名字命中在线玩家时踢出（成功则 Kick(..., saveSSI: true)）。
+        """
+        sent = 0
+        for rec in self.visible_records(gid):
+            token = rec.get("token")
+            ws = self._ws_by_token.get(token) if token else None
+            if ws is None or ws.closed:
+                continue
+            try:
+                await ws.send_str(json.dumps({
+                    "version": "0.1.0",
+                    "direction": "to_server",
+                    "type": "self_kick",
+                    "is_request": False,
+                    "request_id": None,
+                    "payload": {"name": player_name},
+                }))
+                sent += 1
+            except Exception as e:
+                print(f"[zse_server] 自踢包发送失败: {e}")
+        return sent
+
     # ───────────────────────── 辅助 ─────────────────────────
     def _find_by_code(self, code: str):
+        if not code:
+            return None, None
         for gid, records in self._data.items():
             for rec in records:
-                if rec["code"] == code:
+                # 已使用的绑定码不再匹配：它是一次性凭证，用过了就不能再换 token
+                if rec.get("code") == code and not rec.get("code_used"):
                     return gid, rec
         return None, None
+
+    async def unregister_all(self, gid: str) -> int:
+        """清空某群名下**全部**服务器登记（机器人被重新拉入群时清数据用）。返回清理条数"""
+        gid = gid or "nogroup"
+        records = self._data.get(gid, []) or []
+        targets = [r for r in records if r.get("owner_gid") == gid]
+        for rec in targets:
+            token = rec.get("token")
+            ws = self._ws_by_token.get(token) if token else None
+            if ws is not None and not ws.closed:
+                try:
+                    await self._send_unbind(ws, "机器人被重新拉入群，该群的服务器绑定已清空")
+                except Exception as e:
+                    print(f"[starZSEbot-server] 解绑通知发送失败: {e}")
+            if token:
+                self._by_token.pop(token, None)
+                self._ws_by_token.pop(token, None)
+        if targets:
+            self._data[gid] = [r for r in records if r.get("owner_gid") != gid]
+            await self._save()
+        return len(targets)
