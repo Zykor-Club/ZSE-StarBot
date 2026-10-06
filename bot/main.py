@@ -3228,13 +3228,12 @@ class GroupReviewClient(botpy.Client):
 
     # ───────────────────────── 喵币（签到 / 积分 / 排行 / 账单） ─────────────────────────
     def _econ_bound_openids(self, gid) -> set:
-        """本联合体系内已绑定白名单的 openid 集合（榜单过滤用）"""
+        """**主群**已绑定白名单的 openid 集合（榜单过滤；与签到资格口径一致）"""
         out = set()
-        for sg in sorted(self.registry.zone_gids(gid)):
-            for rec in (self.whitelist_store._data.get(sg, {}) or {}).values():
-                oid = (rec or {}).get("bind_openid") or ""
-                if oid:
-                    out.add(oid)
+        for rec in (self.whitelist_store._data.get(self._eff_gid(gid), {}) or {}).values():
+            oid = (rec or {}).get("bind_openid") or ""
+            if oid:
+                out.add(oid)
         return out
 
     def _econ_openid_of_name(self, gid, name: str) -> str:
@@ -3263,12 +3262,16 @@ class GroupReviewClient(botpy.Client):
         return names
 
     def _econ_my_names(self, gid, user_openid: str) -> list:
-        """某个 openid 绑定的玩家名（签到/我的积分/退群冻结用）"""
+        """某个 openid 在**联合体主群**绑定的玩家名（与"能否进服"口径一致）。
+        必须真的是本人绑定：老记录 bind_openid 为空时 _login_authorized 会放行任何人，
+        签到不能沿用该兜底，否则任何人都能拿别人的名字签到。"""
+        eff = self._eff_gid(gid)
         mine = []
-        for sg in sorted(self.registry.zone_gids(gid)):
-            for nm in (self.whitelist_store._data.get(sg, {}) or {}):
-                if nm not in mine and self._login_authorized(sg, nm, user_openid, gid):
-                    mine.append(nm)
+        for nm, rec in (self.whitelist_store._data.get(eff, {}) or {}).items():
+            if nm in mine or not (rec or {}).get("bind_openid"):
+                continue
+            if self._login_authorized(eff, nm, user_openid, gid):
+                mine.append(nm)
         return mine
 
     async def _econ_avatar_bytes(self, openid: str, size: int = 640) -> bytes:
@@ -3412,10 +3415,15 @@ class GroupReviewClient(botpy.Client):
         want = rest.split()[0] if rest.split() else ""
         eff = self._eff_gid(gid)
         if not want:
-            name, err = self._econ_pick(gid, user_openid, "", strict=False)
-            if err:
-                await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+            _names = self._econ_my_names(gid, user_openid) or self._econ_all_my_names(user_openid)
+            if not _names:
+                await self._reply_markdown(message, "\n".join([
+                    title, "",
+                    "**还没有绑定白名单喵**",
+                    "> `绑定邮箱 <邮箱>` → 游戏内取验证码 → `添加白名单 <玩家名> <验证码>`",
+                ]))
                 return
+            name = _names[0]   # 钱包按人（openid）算，多个名字取第一个即可
             target_oid = user_openid
             rec = self.whitelist_store.get_record(eff, name) or {}
         else:
@@ -3897,6 +3905,8 @@ class GroupReviewClient(botpy.Client):
                         if not _code:
                             continue
                         _ok, _d = await self.zse_server.request_playtime(_code, timeout=15)
+                        if not _ok:
+                            _log.warning("在线时长请求失败(%s): %s", _code[:8], _d)
                         _items = (_d or {}).get("items") if isinstance(_d, dict) else None
                         for _it in (_items or []):
                             _acc, _sec = (_it or {}).get("account"), int((_it or {}).get("seconds") or 0)

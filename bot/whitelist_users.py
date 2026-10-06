@@ -54,6 +54,11 @@ DDL = [
 ]
 
 
+def snapshot_items(d):
+    """稳定的 items 列表（配合快照使用）"""
+    return list((d or {}).items())
+
+
 class WhitelistUsers:
     def __init__(self, path: str = ""):
         self.path = path or os.environ.get("WHITELIST_USERS_DB") or DEFAULT_DB
@@ -76,8 +81,10 @@ class WhitelistUsers:
         data: {group_openid: {name: record}}；devices_of(record) 用于取设备列表（兼容旧 uuid 字段）。"""
         now = int(time.time())
         users = devs = cities = skipped = 0
+        # 深拷贝一层快照：白名单字典会被消息线程改动，直接迭代会抛"字典在迭代中被修改"
+        snap = {g: dict(v or {}) for g, v in list((data or {}).items())}
         with self._lock, self._conn() as c:
-            for gid, group in list((data or {}).items()):
+            for gid, group in snapshot_items(snap):
                 for name, rec in list((group or {}).items()):
                     rec = rec or {}
                     openid = (rec.get("bind_openid") or "").strip()
