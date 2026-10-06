@@ -953,9 +953,7 @@ class GroupReviewClient(botpy.Client):
         if unfrozen:
             _log.info("已自动解冻 %s 的 %s 条白名单（重新入群）", member_openid, unfrozen)
         # 喵币：回群解冻（放在白名单解冻之后，确保归属判定可用）
-        for _nm in self._econ_my_names(self._eff_gid(group_openid), member_openid):
-            self.economy.freeze(_nm, False)
-            _log.info("已解冻 %s 的喵币账号", _nm)
+        self.economy.freeze(member_openid, False)
         # 群聊 @ 用户：最新格式 <qqbot-at-user id="" />（旧格式 <@userid> 即将弃用）
         at_tag = f'<qqbot-at-user id="{member_openid}" />' if member_openid else "@新成员"
         welcome_lines = [
@@ -1023,10 +1021,9 @@ class GroupReviewClient(botpy.Client):
         group_openid = event.group_openid
         if not group_openid:
             return
-        # 喵币：先冻结（在白名单冻结之前，保证归属判定可用），回群时自动解冻
-        for _nm in self._econ_my_names(self._eff_gid(group_openid), mid):
-            self.economy.freeze(_nm, True)
-            _log.info("已冻结 %s 的喵币账号（退群）", _nm)
+        mid = event.member_openid or ""
+        # 喵币：钱包按 openid 一人一份 → 直接冻结这个人
+        self.economy.freeze(mid, True)
         frozen_cnt = self.whitelist_store.freeze_by_openid(self._eff_gid(group_openid), mid)
         if frozen_cnt:
             _log.info("已冻结 %s 的 %s 条白名单（退群）", mid, frozen_cnt)
