@@ -101,6 +101,7 @@ from lexicon import Lexicon
 from lexicon_render import render_lexicon_card
 from server_status_store import ServerStatusStore
 from economy_store import EconomyStore, SIGN_BASE, SIGN_BONUS, MAX_ADD
+from whitelist_users import WhitelistUsers
 from seeds import Seeds
 from seed_render import render_seed_list_card
 from permissions import (
@@ -245,6 +246,9 @@ class GroupReviewClient(botpy.Client):
         # 喵币账本（机器人侧 SQLite：全联合体系 + 全服务器共用一份）
         self.economy = EconomyStore()
         self._econ_clear_ts = 0.0
+        # 白名单"以人为主体"的新表（第 1 步：只积累数据 + 定期回填，不改进服判定）
+        self.whitelist_users = WhitelistUsers()
+        self._wl_sync_ts = 0.0
         self.status_store = ServerStatusStore()
         # 投票结果卡发布锁：结束投票指令与 60 秒调度可能同时想发布同一场投票，
         # 不加锁会出现"结果卡发两轮"（每个群多一张卡）
@@ -3741,6 +3745,17 @@ class GroupReviewClient(botpy.Client):
                 await self._vote_tick()
             except Exception as e:
                 _log.exception("种子投票调度出错: %s", e)
+            # 白名单新表回填（第 1 步：只写不读，每 5 分钟一次，幂等 upsert）
+            if time.time() - self._wl_sync_ts > 300:
+                self._wl_sync_ts = time.time()
+                try:
+                    _st = self.whitelist_users.sync(
+                        self.whitelist_store._data,
+                        devices_of=self.whitelist_store._devices)
+                    _log.info("白名单新表回填：用户 %s、设备 %s、城市 %s、无绑定人跳过 %s",
+                              _st["users"], _st["devices"], _st["cities"], _st["skipped_no_openid"])
+                except Exception as e:
+                    _log.warning("白名单新表回填失败: %s", e)
             # 喵币：冻结超过 7 天的账号清零（每 6 小时扫一次，条件天然幂等）
             if time.time() - self._econ_clear_ts > 6 * 3600:
                 self._econ_clear_ts = time.time()
