@@ -905,8 +905,8 @@ class GroupReviewClient(botpy.Client):
         if low.startswith("清空设备"):  # 清空设备 [玩家名]：清空本人已登录设备（下次进服重新登录）；联合区共用
             await self.cmd_clear_devices(message, text, gid)
             return
-        if low.startswith("玩家查询"):  # 玩家查询 <玩家名>：查看绑定信息
-            await self.cmd_player_query(message, text, gid)
+        if low.startswith(("玩家查询", "信息查询")):  # 已并入「我的信息」
+            await self.cmd_my_points(message, text, gid, user_openid)
             return
 
         # ── GitHub ──
@@ -3309,25 +3309,31 @@ class GroupReviewClient(botpy.Client):
         return (str(h) + " 小时 " + str(mnt) + " 分") if h else (str(mnt) + " 分")
 
     def _econ_info_rows(self, gid, name: str, earned: int, sign_state: str, streak: int,
-                        sign_ts: int, today_rank: int) -> list:
+                        sign_ts: int, today_rank: int, rec: dict | None = None, extra: list | None = None) -> list:
+        rec = rec if rec is not None else (self.whitelist_store.get_record(self._eff_gid(gid), name) or {})
+
+        def _fmt(ts):
+            return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "（暂无）"
+
         ts_txt = time.strftime("%m-%d %H:%M:%S", time.localtime(sign_ts)) if sign_ts else "（今天还没签到）"
         rank_txt = ("今天第 " + str(today_rank) + " 位签到") if today_rank else "—"
-        return [
+        rows = [
             ("玩家名", name),
-            ("QQ邮箱", self._econ_email(gid, name)),
+            ("QQ邮箱", rec.get("email") or "（未记录）"),
             ("签到情况", sign_state),
             ("总签到积分", str(earned)),
             ("签到时间", ts_txt),
             ("签到排名", rank_txt),
             ("连签天数", str(streak) + " 天"),
             ("总在线时长", self._econ_playtime_text(name)),
+            ("绑定时间", _fmt(rec.get("bind_time"))),
+            ("最后进服", _fmt(rec.get("last_join_time"))),
         ]
-
-    def _econ_day_start(self) -> int:
-        """北京时间今天 00:00 对应的时间戳（用于统计今日签到顺序）"""
-        now = time.time() + 8 * 3600
-        return int(now - (now % 86400) - 8 * 3600)
-
+        if extra:
+            rows[3:3] = list(extra)
+        if rec.get("frozen"):
+            rows.append(("白名单", "已冻结（重新入群自动解冻）"))
+        return rows
     def _econ_today(self) -> str:
         """机器人侧按北京时间（UTC+8）算自然日"""
         return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
@@ -3399,35 +3405,51 @@ class GroupReviewClient(botpy.Client):
         await self._reply_markdown(message, "\n".join(lines))
 
     async def cmd_my_points(self, message, text: str, gid, user_openid: str = ""):
-        """我的积分 [玩家名]：余额 / 累计 / 连续 / 排名"""
-        title = self.build_card_title("我的积分")
-        _mp = next((p for p in ("我的信息", "我的积分", "我的喵币") if text.startswith(p)), "我的信息")
+        """我的信息 [玩家名]：不带参数=查自己；带参数=查该玩家（= 原「玩家查询」，联合体总群口径）"""
+        title = self.build_card_title("我的信息")
+        _mp = next((p for p in ("我的信息", "我的积分", "我的喵币", "玩家查询", "信息查询") if text.startswith(p)), "我的信息")
         rest = text[len(_mp):].lstrip("：: \t").strip()
         want = rest.split()[0] if rest.split() else ""
-        name, err = self._econ_pick(gid, user_openid, want)
-        if err:
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
-            return
-        row = self.economy.get(user_openid)
-        # 图片卡（渲染/发送失败则回落到下面的文字卡）
+        eff = self._eff_gid(gid)
+        if not want:
+            name, err = self._econ_pick(gid, user_openid, "", strict=False)
+            if err:
+                await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+                return
+            target_oid = user_openid
+            rec = self.whitelist_store.get_record(eff, name) or {}
+        else:
+            name = want
+            rec = self.whitelist_store.get_record(eff, name)
+            if rec is None:
+                await self._reply_markdown(message, "\n".join([
+                    title, "", f"**❌ 未找到 `{name}` 的绑定记录喵**",
+                    "> 请确认玩家名正确，且已在总群绑定白名单",
+                ]))
+                return
+            target_oid = rec.get("bind_openid") or ""
+        row = self.economy.get(target_oid or "")
+        mine = (not want) or (target_oid == user_openid)
+        # 图片卡（失败回落文字）
         try:
             _send_gid = gid or (getattr(message, "group_openid", None) or "")
-            _state = ("今天已签到（" + str(row.get("last_sign_date") or "") + "）"
-                      if row.get("last_sign_date") == self._econ_today() else "今天还没签到")
+            _today = self._econ_today()
+            _signed = bool(row.get("last_sign_date")) and row.get("last_sign_date") == _today
+            _state = ("今天已签到（" + str(row.get("last_sign_date") or "") + "）" if _signed else "今天还没签到")
+            _extra = [("喵币余额", str(row.get("balance") or 0)), ("累计消费", str(row.get("total_spent") or 0))]
             _rows = self._econ_info_rows(
                 gid, name, int(row.get("total_earned") or 0), _state, int(row.get("streak") or 0),
-                self.economy.last_sign_ts(user_openid), self.economy.today_rank(user_openid, self._econ_day_start()))
-            _rows.insert(3, ("喵币余额", str(row.get("balance") or 0)))
-            _rows.insert(4, ("累计消费", str(row.get("total_spent") or 0)))
+                self.economy.last_sign_ts(target_oid or ""),
+                self.economy.today_rank(target_oid or "", self._econ_day_start()) if target_oid else 0,
+                rec=rec, extra=_extra)
             _png = render_info_card(
                 name, _rows,
-                avatar_bytes=await self._econ_avatar_bytes(user_openid),
-                banner=("今日已签到" if row.get("last_sign_date") == self._econ_today() else "今天还没签到"),
-                subtitle=self._econ_email(gid, name) + " · " + self._econ_today(),
+                avatar_bytes=await self._econ_avatar_bytes(target_oid or ""),
+                banner=("今日已签到" if _signed else "今天还没签到"),
+                subtitle=(rec.get("email") or "未绑定邮箱") + " · " + _today,
                 badges=[("连续签到第 " + str(int(row.get("streak") or 0)) + " 天", "gold"),
                         (str(row.get("balance") or 0) + " 喵币", "blue"),
-                        ("已签到" if row.get("last_sign_date") == self._econ_today() else "未签到",
-                         "green" if row.get("last_sign_date") == self._econ_today() else "plain")],
+                        ("已签到" if _signed else "未签到", "green" if _signed else "plain")],
                 footer="Generated by ZSE StarBot", bg_dir=self._vote_bg_dir())
             if _png:
                 await send_group_image(self, _send_gid, _png, filename="myinfo.jpg",
@@ -3442,14 +3464,10 @@ class GroupReviewClient(botpy.Client):
             lines.append(f"- 连续签到：**{row['streak']}** 天（上次 {row['last_sign_date']}）")
         else:
             lines.append("- 连续签到：还没签到过")
-        lines.append(f"- 排名：余额第 **{self.economy.rank_of(user_openid)}** 名｜累计第 **{self.economy.rank_of(user_openid, 'earned')}** 名")
-        if row.get("frozen_at"):
-            lines.append("> ⚠️ 该账号因退群处于冻结状态（7 天后清零）")
-        if row["last_sign_date"] != self._econ_today():
-            lines.append("")
-            lines.append("> 今天还没签到，发 `签到` 领 15~35 喵币喵～")
+        lines.append(f"- 绑定邮箱：{rec.get('email') or '（未绑定邮箱）'}")
+        lines.append(f"- 绑定时间：{time.strftime('%Y-%m-%d %H:%M', time.localtime(rec.get('bind_time') or 0)) if rec.get('bind_time') else '（暂无）'}")
+        lines.append(f"- 最后进服：{time.strftime('%Y-%m-%d %H:%M', time.localtime(rec.get('last_join_time') or 0)) if rec.get('last_join_time') else '（暂无）'}")
         await self._reply_markdown(message, "\n".join(lines))
-
     async def cmd_bill(self, message, text: str, gid, user_openid: str = ""):
         """账单 [页码]：喵币流水"""
         title = self.build_card_title("账单")

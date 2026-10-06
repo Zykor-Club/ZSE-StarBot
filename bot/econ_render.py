@@ -139,24 +139,27 @@ def render_info_card(name: str, rows, banner: str = "", subtitle: str = "",
             x = nx2 + px(14)
         y += bh2 + px(18)
     rows = list(rows or [])
-    row_h = px(62)
     inner = px(30)
     bottom = H - pad - px(46)
+    # 行高自适应：按剩余空间摊分，保证不裁行（最小值 40）；字体随行高缩放
+    avail = max(px(40), bottom - y - inner * 2)
+    row_h = px(62) if len(rows) <= 1 else max(px(40), min(px(62), avail // len(rows)))
+    fscale = min(1.0, row_h / float(px(62)))
     panel_bottom = min(y + inner * 2 + row_h * len(rows), bottom)
     od.rounded_rectangle([pad, y, W - pad, panel_bottom], radius=px(20), fill=PANEL)
     label_w = px(230)
     value_x = pad + inner + label_w
     value_w = max(px(80), W - pad - inner - value_x)
-    lab_f = _font(px(32))
+    lab_f = _font(max(px(22), int(px(32) * fscale)))
     yy = y + inner
     for i, (label, value) in enumerate(rows):
         if yy + row_h > panel_bottom:
             od.text((pad + inner, yy), "…（显示不下，剩余 " + str(len(rows) - i) + " 项）", font=lab_f, fill=DIM)
             break
-        od.text((pad + inner, yy + px(14)), clean_text(str(label)), font=lab_f, fill=LABEL)
+        od.text((pad + inner, yy + int(row_h * 0.22)), clean_text(str(label)), font=lab_f, fill=LABEL)
         txt = clean_text(str(value))
-        vf = _shrink(measure, txt, lambda d: _font(px(34) + d, bold=True), value_w, px(20))
-        od.text((value_x, yy + px(12)), _truncate(measure, txt, vf, value_w), font=vf, fill=WHITE)
+        vf = _shrink(measure, txt, lambda d: _font(int(px(34) * fscale) + d, bold=True), value_w, px(18))
+        od.text((value_x, yy + int(row_h * 0.16)), _truncate(measure, txt, vf, value_w), font=vf, fill=WHITE)
         if i != len(rows) - 1:
             ly = yy + row_h - px(2)
             od.line([pad + inner, ly, W - pad - inner, ly], fill=SEP, width=max(1, px(1)))
