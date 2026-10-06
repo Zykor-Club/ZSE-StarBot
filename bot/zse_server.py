@@ -770,6 +770,10 @@ class ZseServer:
             payload.update({"difficulty": difficulty, "size": size, "evil": evil})
         return await self._request_plugin(server_code, "world_settings", payload, timeout)
 
+    async def request_playtime(self, server_code: str, timeout: float = 20.0):
+        """累计在线时长（永不重置）。返回 (ok, data)：data["items"] = [{account, seconds}, ...]"""
+        return await self._request_plugin(server_code, "playtime", {}, timeout)
+
     async def request_progress(self, server_code: str, timeout: float = 15.0):
         """进度查询请求（boss 击杀情况）。返回 (ok, data)"""
         return await self._request_plugin(server_code, "progress", {}, timeout)

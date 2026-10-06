@@ -103,6 +103,7 @@ from lexicon_render import render_lexicon_card
 from server_status_store import ServerStatusStore
 from economy_store import EconomyStore, SIGN_BASE, SIGN_BONUS, MAX_ADD
 from whitelist_users import WhitelistUsers
+from econ_render import render_info_card, render_rank_card
 from seeds import Seeds
 from seed_render import render_seed_list_card
 from permissions import (
@@ -250,6 +251,9 @@ class GroupReviewClient(botpy.Client):
         # 白名单"以人为主体"的新表（第 1 步：只积累数据 + 定期回填，不改进服判定）
         self.whitelist_users = WhitelistUsers()
         self._wl_sync_ts = 0.0
+        # 累计在线时长缓存 {玩家名: 秒}：各服上报后按账号取最大（一个人不可能同时在两个服玩）
+        self._playtime = {}
+        self._playtime_ts = 0.0
         self.status_store = ServerStatusStore()
         # 投票结果卡发布锁：结束投票指令与 60 秒调度可能同时想发布同一场投票，
         # 不加锁会出现"结果卡发两轮"（每个群多一张卡）
@@ -3267,6 +3271,38 @@ class GroupReviewClient(botpy.Client):
                     mine.append(nm)
         return mine
 
+    def _econ_email(self, gid, name: str) -> str:
+        rec = self.whitelist_store.get_record(self._eff_gid(gid), name) or {}
+        return rec.get("email") or "（未记录）"
+
+    def _econ_playtime_text(self, name: str) -> str:
+        sec = int(self._playtime.get(name) or 0)
+        if sec <= 0:
+            return "统计中（需在服内累计）"
+        h, rem = divmod(sec, 3600)
+        mnt = rem // 60
+        return (str(h) + " 小时 " + str(mnt) + " 分") if h else (str(mnt) + " 分")
+
+    def _econ_info_rows(self, gid, name: str, earned: int, sign_state: str, streak: int,
+                        sign_ts: int, today_rank: int) -> list:
+        ts_txt = time.strftime("%m-%d %H:%M:%S", time.localtime(sign_ts)) if sign_ts else "（今天还没签到）"
+        rank_txt = ("今天第 " + str(today_rank) + " 位签到") if today_rank else "—"
+        return [
+            ("玩家名", name),
+            ("QQ邮箱", self._econ_email(gid, name)),
+            ("签到情况", sign_state),
+            ("总签到积分", str(earned)),
+            ("签到时间", ts_txt),
+            ("签到排名", rank_txt),
+            ("连签天数", str(streak) + " 天"),
+            ("总在线时长", self._econ_playtime_text(name)),
+        ]
+
+    def _econ_day_start(self) -> int:
+        """北京时间今天 00:00 对应的时间戳（用于统计今日签到顺序）"""
+        now = time.time() + 8 * 3600
+        return int(now - (now % 86400) - 8 * 3600)
+
     def _econ_today(self) -> str:
         """机器人侧按北京时间（UTC+8）算自然日"""
         return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
@@ -3307,6 +3343,22 @@ class GroupReviewClient(botpy.Client):
                 f"> 余额：**{row['balance']}** 喵币｜连续 **{row['streak']}** 天",
             ]))
             return
+        # 图片卡（渲染/发送失败则回落到下面的文字卡）
+        try:
+            _send_gid = gid or (getattr(message, "group_openid", None) or "")
+            _state = "本次 +" + str(amt) + " 喵币" + (("（含连续/里程碑奖励 +" + str(extra) + "）") if extra else "")
+            _rows = self._econ_info_rows(
+                gid, name, int(self.economy.get(user_openid).get("total_earned") or 0), _state, streak,
+                self.economy.last_sign_ts(user_openid), self.economy.today_rank(user_openid, self._econ_day_start()))
+            _png = render_info_card("签到成功", _rows, subtitle="我的信息",
+                                    badge=("连续签到第 " + str(streak) + " 天" if streak else ""),
+                                    footer="starZSEbot · 喵币", bg_dir=self._vote_bg_dir())
+            if _png:
+                await send_group_image(self, _send_gid, _png, filename="sign.jpg",
+                                       msg_id=getattr(message, "id", None))
+                return
+        except Exception as e:
+            _log.warning("签到卡渲染/发送失败，回落文字卡: %s", e)
         lines = [title, "", f"**🐾 签到成功！本次 +{amt} 喵币**", ""]
         if extra:
             lines.append(f"- 其中连续/里程碑奖励：**+{extra}**")
@@ -3383,6 +3435,22 @@ class GroupReviewClient(botpy.Client):
         if not page_rows:
             await self._reply_markdown(message, "\n".join([title, "", "**本群还没有可展示的喵币榜单喵...**"]))
             return
+        # 图片卡（失败回落文字）
+        try:
+            _send_gid = gid or (getattr(message, "group_openid", None) or "")
+            _items = [((page - 1) * per + i + 1, (r.get("name") or "?"),
+                       (r["earned"] if by == "earned" else r["balance"]))
+                      for i, r in enumerate(page_rows)]
+            _png = render_rank_card(_items, subtitle=("累计获取榜" if by == "earned" else "余额榜"),
+                                    page=page, total_pages=max(1, (len(rows) + per - 1) // per),
+                                    value_label="喵币", footer=("翻页：积分排行 " + str(page + 1)),
+                                    bg_dir=self._vote_bg_dir())
+            if _png:
+                await send_group_image(self, _send_gid, _png, filename="econ_rank.jpg",
+                                       msg_id=getattr(message, "id", None))
+                return
+        except Exception as e:
+            _log.warning("积分排行卡渲染/发送失败，回落文字卡: %s", e)
         medal = ["🥇", "🥈", "🥉"]
         lines = [title, "", f"**{'累计获取' if by == 'earned' else '喵币余额'}榜**（本联合体系）", ""]
         for i, r in enumerate(page_rows):
@@ -3745,6 +3813,25 @@ class GroupReviewClient(botpy.Client):
                 await self._vote_tick()
             except Exception as e:
                 _log.exception("种子投票调度出错: %s", e)
+            # 累计在线时长汇总（各服上报 → 按账号取最大，永不重置）
+            if time.time() - self._playtime_ts > 300:
+                self._playtime_ts = time.time()
+                try:
+                    _pt = {}
+                    for _rec in (self.zse_server.all_records() or []):
+                        _code = _rec.get("code") if isinstance(_rec, dict) else None
+                        if not _code:
+                            continue
+                        _ok, _d = await self.zse_server.request_playtime(_code, timeout=15)
+                        _items = (_d or {}).get("items") if isinstance(_d, dict) else None
+                        for _it in (_items or []):
+                            _acc, _sec = (_it or {}).get("account"), int((_it or {}).get("seconds") or 0)
+                            if _acc:
+                                _pt[_acc] = max(_pt.get(_acc, 0), _sec)
+                    if _pt:
+                        self._playtime = _pt
+                except Exception as e:
+                    _log.warning("在线时长汇总失败: %s", e)
             # 白名单新表回填（第 1 步：只写不读，每 5 分钟一次，幂等 upsert）
             if time.time() - self._wl_sync_ts > 300:
                 self._wl_sync_ts = time.time()
