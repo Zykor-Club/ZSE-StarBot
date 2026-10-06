@@ -76,7 +76,7 @@ def _pill(od, measure, x, y, text, key, s, pad_x, h, max_right):
 
 def render_info_card(name: str, rows, banner: str = "", subtitle: str = "",
                      badges=None, footer: str = "", bg_dir=None, bg_file=None,
-                     jpeg_quality: int = 88) -> bytes:
+                     avatar_bytes: bytes = b"", jpeg_quality: int = 88) -> bytes:
     img, overlay, od, W, H, s = _canvas(bg_dir, bg_file)
     measure = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
 
@@ -87,10 +87,26 @@ def render_info_card(name: str, rows, banner: str = "", subtitle: str = "",
     od.rectangle([0, 0, W, H], fill=SCRIM)
     av = px(96)
     ax, ay = pad, pad
-    od.ellipse([ax, ay, ax + av, ay + av], fill=(70, 92, 140, 235),
-               outline=(190, 210, 250, 190), width=max(1, px(3)))
-    ch = clean_text(str(name or "?"))[:1] or "?"
-    od.text((ax + av / 2, ay + av / 2 - px(4)), ch, font=_font(px(46), bold=True), fill=WHITE, anchor="mm")
+    pasted = False
+    if avatar_bytes:
+        try:
+            src = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+            side = min(src.size)
+            left = (src.width - side) // 2
+            top = (src.height - side) // 2
+            src = src.crop((left, top, left + side, top + side)).resize((av, av), Image.LANCZOS)
+            mask = Image.new("L", (av * 4, av * 4), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, av * 4, av * 4], fill=255)
+            mask = mask.resize((av, av), Image.LANCZOS)
+            overlay.paste(src, (ax, ay), mask)
+            pasted = True
+        except Exception:
+            pasted = False
+    if not pasted:
+        od.ellipse([ax, ay, ax + av, ay + av], fill=(70, 92, 140, 235))
+        ch = clean_text(str(name or "?"))[:1] or "?"
+        od.text((ax + av / 2, ay + av / 2 - px(4)), ch, font=_font(px(46), bold=True), fill=WHITE, anchor="mm")
+    od.ellipse([ax, ay, ax + av, ay + av], outline=(190, 210, 250, 200), width=max(1, px(3)))
     nx = ax + av + px(26)
     avail = W - nx - pad - px(200)
     name_f = _shrink(measure, clean_text(str(name)), lambda d: _font(px(50) + d, bold=True), avail, px(26))

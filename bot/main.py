@@ -3271,6 +3271,31 @@ class GroupReviewClient(botpy.Client):
                     mine.append(nm)
         return mine
 
+    async def _econ_avatar_bytes(self, openid: str, size: int = 640) -> bytes:
+        """下载 QQ 头像（qlogo 直连，无需额外接口权限）；带内存缓存，失败返回空（卡片回落首字）"""
+        if not self._appid or not openid:
+            return b""
+        cache = getattr(self, "_avatar_cache", None)
+        if cache is None:
+            cache = self._avatar_cache = {}
+        if openid in cache:
+            return cache[openid]
+        data = b""
+        # qlogo 的 qqapp 接口只对特定尺寸有效（实测 640 可用，200/100 返回 400）→ 逐个尝试
+        for _sz in (640, 0, 100):
+            url = "https://q.qlogo.cn/qqapp/" + str(self._appid) + "/" + openid + "/" + str(_sz)
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                        if r.status == 200:
+                            data = await r.read()
+                            break
+            except Exception as e:
+                _log.debug("头像下载失败 %s(size=%s): %s", openid[:8], _sz, e)
+        if data:
+            cache[openid] = data
+        return data
+
     def _econ_email(self, gid, name: str) -> str:
         rec = self.whitelist_store.get_record(self._eff_gid(gid), name) or {}
         return rec.get("email") or "（未记录）"
@@ -3396,6 +3421,7 @@ class GroupReviewClient(botpy.Client):
             _rows.insert(4, ("累计消费", str(row.get("total_spent") or 0)))
             _png = render_info_card(
                 name, _rows,
+                avatar_bytes=await self._econ_avatar_bytes(user_openid),
                 banner=("今日已签到" if row.get("last_sign_date") == self._econ_today() else "今天还没签到"),
                 subtitle=self._econ_email(gid, name) + " · " + self._econ_today(),
                 badges=[("连续签到第 " + str(int(row.get("streak") or 0)) + " 天", "gold"),
@@ -5110,7 +5136,7 @@ class GroupReviewClient(botpy.Client):
         nm = self.whitelist_store.find_by_openid(gid, openid)
         return nm or (f"{openid[:8]}…" if openid else "未知用户")
 
-    def _player_avatar_url(self, gid, player_name: str, size: int = 100) -> str:
+    def _player_avatar_url(self, gid, player_name: str, size: int = 640) -> str:
         """按玩家名反查其绑定 QQ（白名单 bind_openid），构造 qlogo 头像 URL；查不到（未绑定白名单）返回空串"""
         if not self._appid:
             return ""
@@ -5125,7 +5151,7 @@ class GroupReviewClient(botpy.Client):
         url = self._player_avatar_url(gid, player_name)
         return f"![头像 #{px}px #{px}px]({url})" if url else ""
 
-    def _openid_avatar_md(self, openid: str, size: int = 100, px: int = 20) -> str:
+    def _openid_avatar_md(self, openid: str, size: int = 640, px: int = 20) -> str:
         """按 openid 直接构造 qlogo 头像 Markdown 片段"""
         if not self._appid or not openid:
             return ""
