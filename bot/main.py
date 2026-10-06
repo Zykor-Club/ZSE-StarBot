@@ -100,6 +100,7 @@ import lexicon
 from lexicon import Lexicon
 from lexicon_render import render_lexicon_card
 from server_status_store import ServerStatusStore
+from economy_store import EconomyStore, SIGN_BASE, SIGN_BONUS, MAX_ADD
 from seeds import Seeds
 from seed_render import render_seed_list_card
 from permissions import (
@@ -109,7 +110,7 @@ from permissions import (
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_EXEC,
     PERM_MAP_FETCH, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW, PERM_ROLE_MANAGE,
     PERM_BROADCAST, PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET, PERM_VOTE_PROPOSAL_DEL,
-PERM_BACKUP, PERM_WORLD_SETTINGS, PERM_BACKUP_RESTORE,
+PERM_BACKUP, PERM_WORLD_SETTINGS, PERM_BACKUP_RESTORE, PERM_ECON_ADMIN,
     PERM_PROGRESS_NOTIFY, PERM_SAY_ALL, PERM_STATUS_NOTIFY, 
 )
 from github_monitor import (
@@ -241,6 +242,9 @@ class GroupReviewClient(botpy.Client):
         self.whitelist_store = WhitelistStore()
         self.lexicon_store = Lexicon()
         self.seeds = Seeds()
+        # 喵币账本（机器人侧 SQLite：全联合体系 + 全服务器共用一份）
+        self.economy = EconomyStore()
+        self._econ_clear_ts = 0.0
         self.status_store = ServerStatusStore()
         # 投票结果卡发布锁：结束投票指令与 60 秒调度可能同时想发布同一场投票，
         # 不加锁会出现"结果卡发两轮"（每个群多一张卡）
@@ -757,6 +761,28 @@ class GroupReviewClient(botpy.Client):
         if low.startswith("世界设置"):  # 世界设置 <序号> [难度/大小/邪恶 值…]（改设置需管理员+）
             await self.cmd_world_settings(message, text, gid, user_openid)
             return
+        if low.startswith("签到"):  # 签到 [玩家名]（需已绑定白名单）
+            await self.cmd_sign(message, text, gid, user_openid)
+            return
+        if low.startswith(("我的积分", "我的喵币")):
+            await self.cmd_my_points(message, text, gid, user_openid)
+            return
+        if low.startswith("积分排行"):
+            await self.cmd_points_rank(message, text, gid, user_openid)
+            return
+        if low.startswith("账单"):
+            await self.cmd_bill(message, text, gid, user_openid)
+            return
+        if low.startswith(("发币", "扣币")):
+            if not await self._perm_ok(message, gid, user_openid, PERM_ECON_ADMIN, "喵币管理"):
+                return
+            await self.cmd_econ_grant(message, text, gid, user_openid)
+            return
+        if low.startswith("重置经济"):
+            if not await self._perm_ok(message, gid, user_openid, PERM_ECON_ADMIN, "重置经济"):
+                return
+            await self.cmd_econ_reset(message, text, gid, user_openid)
+            return
         if low.startswith("备份列表") or low.startswith("备份 列表"):  # 备份列表 <序号>
             await self.cmd_backup_list(message, text, gid)
             return
@@ -921,6 +947,10 @@ class GroupReviewClient(botpy.Client):
         unfrozen = self.whitelist_store.unfreeze_by_openid(self._eff_gid(group_openid), member_openid)
         if unfrozen:
             _log.info("已自动解冻 %s 的 %s 条白名单（重新入群）", member_openid, unfrozen)
+        # 喵币：回群解冻（放在白名单解冻之后，确保归属判定可用）
+        for _nm in self._econ_my_names(self._eff_gid(group_openid), member_openid):
+            self.economy.freeze(_nm, False)
+            _log.info("已解冻 %s 的喵币账号", _nm)
         # 群聊 @ 用户：最新格式 <qqbot-at-user id="" />（旧格式 <@userid> 即将弃用）
         at_tag = f'<qqbot-at-user id="{member_openid}" />' if member_openid else "@新成员"
         welcome_lines = [
@@ -988,8 +1018,10 @@ class GroupReviewClient(botpy.Client):
         group_openid = event.group_openid
         if not group_openid:
             return
-        mid = event.member_openid or ""
-        # 冻结其名下全部白名单
+        # 喵币：先冻结（在白名单冻结之前，保证归属判定可用），回群时自动解冻
+        for _nm in self._econ_my_names(self._eff_gid(group_openid), mid):
+            self.economy.freeze(_nm, True)
+            _log.info("已冻结 %s 的喵币账号（退群）", _nm)
         frozen_cnt = self.whitelist_store.freeze_by_openid(self._eff_gid(group_openid), mid)
         if frozen_cnt:
             _log.info("已冻结 %s 的 %s 条白名单（退群）", mid, frozen_cnt)
@@ -3188,6 +3220,205 @@ class GroupReviewClient(botpy.Client):
             f"- 存档推送：成功 {ok_cnt}/{len(targets)} 个群\n"
             f"- 存档文件：`{zip_name}`" + closed_note + self._vote_failed_line(failed))
 
+    # ───────────────────────── 喵币（签到 / 积分 / 排行 / 账单） ─────────────────────────
+    def _econ_bound_names(self, gid) -> list:
+        """本联合体系内已绑定白名单的玩家名（积分排行过滤用）"""
+        names = []
+        for sg in sorted(self.registry.zone_gids(gid)):
+            for nm in (self.whitelist_store._data.get(sg, {}) or {}):
+                if nm not in names:
+                    names.append(nm)
+        return names
+
+    def _econ_my_names(self, gid, user_openid: str) -> list:
+        """某个 openid 绑定的玩家名（签到/我的积分/退群冻结用）"""
+        mine = []
+        for sg in sorted(self.registry.zone_gids(gid)):
+            for nm in (self.whitelist_store._data.get(sg, {}) or {}):
+                if nm not in mine and self._login_authorized(sg, nm, user_openid, gid):
+                    mine.append(nm)
+        return mine
+
+    def _econ_today(self) -> str:
+        """机器人侧按北京时间（UTC+8）算自然日"""
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
+    def _econ_pick(self, gid, user_openid: str, want: str):
+        """选定要操作的玩家名；返回 (name, err)"""
+        names = self._econ_my_names(gid, user_openid)
+        if want:
+            if want in names:
+                return want, ""
+            return "", (f"`{want}` 不是你绑定的玩家名喵\n"
+                        f"> 你绑定的是：{('、'.join(names) if names else '（无）')}")
+        if not names:
+            return "", ("还没有绑定白名单喵，签到需要先绑定\n"
+                        "> `绑定邮箱 <邮箱>` → 游戏内取验证码 → `添加白名单 <玩家名> <验证码>`")
+        if len(names) > 1:
+            return "", (f"你绑定了多个玩家名，请指定一个：\n> {('、'.join(names))}\n"
+                        "> 用法：`签到 <玩家名>`")
+        return names[0], ""
+
+    async def cmd_sign(self, message, text: str, gid, user_openid: str = ""):
+        """签到 [玩家名]：需已绑定白名单；基础 15~35 + 连续奖励 3~9（第 2 天起）+ 里程碑"""
+        title = self.build_card_title("签到")
+        rest = text[len("签到"):].lstrip("：: \t").strip()
+        want = rest.split()[0] if rest.split() else ""
+        name, err = self._econ_pick(gid, user_openid, want)
+        if err:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+            return
+        today = self._econ_today()
+        base = random.randint(SIGN_BASE[0], SIGN_BASE[1])
+        bonus = random.randint(SIGN_BONUS[0], SIGN_BONUS[1])
+        ok, msg, bal, streak, amt, extra = self.economy.sign(name, today, base, bonus)
+        if not ok:
+            row = self.economy.get(name)
+            await self._reply_markdown(message, "\n".join([
+                title, "", f"**{msg}**", "",
+                f"> 余额：**{row['balance']}** 喵币｜连续 **{row['streak']}** 天",
+            ]))
+            return
+        lines = [title, "", f"**🐾 签到成功！本次 +{amt} 喵币**", ""]
+        if extra:
+            lines.append(f"- 其中连续/里程碑奖励：**+{extra}**")
+        lines += [f"- 连续签到：**{streak}** 天",
+                  f"- 当前余额：**{bal}** 喵币",
+                  f"- 余额排名：第 **{self.economy.rank_of(name)}** 名",
+                  "", f"> 自然日按北京时间算：{today}"]
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def cmd_my_points(self, message, text: str, gid, user_openid: str = ""):
+        """我的积分 [玩家名]：余额 / 累计 / 连续 / 排名"""
+        title = self.build_card_title("我的积分")
+        rest = text[len("我的积分"):].lstrip("：: \t").strip()
+        want = rest.split()[0] if rest.split() else ""
+        name, err = self._econ_pick(gid, user_openid, want)
+        if err:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+            return
+        row = self.economy.get(name)
+        lines = [title, "", f"**{name}**", "",
+                 f"- 喵币余额：**{row['balance']}**",
+                 f"- 累计获取：{row['total_earned']}｜累计消费：{row['total_spent']}"]
+        if row["last_sign_date"]:
+            lines.append(f"- 连续签到：**{row['streak']}** 天（上次 {row['last_sign_date']}）")
+        else:
+            lines.append("- 连续签到：还没签到过")
+        lines.append(f"- 排名：余额第 **{self.economy.rank_of(name)}** 名｜累计第 **{self.economy.rank_of(name, 'earned')}** 名")
+        if row.get("frozen_at"):
+            lines.append("> ⚠️ 该账号因退群处于冻结状态（7 天后清零）")
+        if row["last_sign_date"] != self._econ_today():
+            lines.append("")
+            lines.append("> 今天还没签到，发 `签到` 领 15~35 喵币喵～")
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def cmd_bill(self, message, text: str, gid, user_openid: str = ""):
+        """账单 [页码]：喵币流水"""
+        title = self.build_card_title("账单")
+        toks = text[len("账单"):].lstrip("：: \t").split()
+        page = int(toks[0]) if toks and toks[0].isdigit() else 1
+        name, err = self._econ_pick(gid, user_openid, "")
+        if err:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
+            return
+        page = max(1, page)
+        per = 10
+        rows = self.economy.logs(name, (page - 1) * per, per)
+        if not rows:
+            await self._reply_markdown(message, "\n".join([title, "", f"**{name}** 还没有任何喵币流水喵"]))
+            return
+        lines = [title, "", f"**{name}** 的流水（第 {page} 页）", ""]
+        for r in rows:
+            sign = "+" if r["delta"] > 0 else ""
+            ts = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
+            lines.append(f"- `{ts}` **{sign}{r['delta']}** → {r['balance_after']}　{r['reason']}")
+        lines.append("")
+        lines.append(f"> 翻页：`账单 {page + 1}`")
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def cmd_points_rank(self, message, text: str, gid, user_openid: str = ""):
+        """积分排行 [累计] [页码]：本联合体系内已绑定白名单玩家的榜单"""
+        title = self.build_card_title("积分排行")
+        rest = text[len("积分排行"):].lstrip("：: \t").strip()
+        by = "earned" if ("累计" in rest or "earned" in rest.lower()) else "balance"
+        toks = [t for t in rest.split() if t.isdigit()]
+        page = max(1, int(toks[0]) if toks else 1)
+        # 取前 200 名后在本地按"本联合体系已绑定白名单"过滤（账本是账号级，榜单是视图）
+        rows = self.economy.top(by, 0, 200)
+        bound = set(self._econ_bound_names(gid))
+        rows = [r for r in rows if r["account"] in bound]
+        per = 20
+        page_rows = rows[(page - 1) * per: page * per]
+        if not page_rows:
+            await self._reply_markdown(message, "\n".join([title, "", "**本群还没有可展示的喵币榜单喵...**"]))
+            return
+        medal = ["🥇", "🥈", "🥉"]
+        lines = [title, "", f"**{'累计获取' if by == 'earned' else '喵币余额'}榜**（本联合体系）", ""]
+        for i, r in enumerate(page_rows):
+            rank = (page - 1) * per + i + 1
+            tag = medal[rank - 1] if rank <= 3 else f"`{rank:>2}`"
+            value = r["earned"] if by == "earned" else r["balance"]
+            lines.append(f"- {tag} **{r['account']}**　{value} 喵币")
+        lines.append("")
+        lines.append(f"> 共 {len(rows)} 人｜翻页：`积分排行 {page + 1}`"
+                     + ("｜切换：`积分排行 累计`" if by != "earned" else "｜切换：`积分排行`"))
+        await self._reply_markdown(message, "\n".join(lines))
+
+    async def cmd_econ_grant(self, message, text: str, gid, user_openid: str = ""):
+        """发币 <玩家名> <数量> [原因] / 扣币 <玩家名> <数量> [原因]（高级管理员）"""
+        is_add = text.startswith("发币")
+        label = "发币" if is_add else "扣币"
+        title = self.build_card_title(label)
+        parts = text[len(label):].lstrip("：: \t").split()
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            await self._reply_markdown(message, "\n".join([
+                title, "", f"**格式：** `{label} <玩家名> <数量> [原因]`", "",
+                f"> 例：`{label} 星梦 100 活动奖励`",
+            ]))
+            return
+        target, amount = parts[0], int(parts[1])
+        reason = " ".join(parts[2:]) or ("admin_grant" if is_add else "admin_deduct")
+        if amount <= 0:
+            await self._reply_markdown(message, "\n".join([title, "", "**数量必须为正喵**"]))
+            return
+        bound = set(self._econ_bound_names(gid))
+        if target not in bound:
+            await self._reply_markdown(message, "\n".join([
+                title, "", f"**❌ `{target}` 不在本联合体系的白名单里喵**",
+                "> 为避免打错名字发错人，只能对本联合体系内已绑定的玩家操作",
+            ]))
+            return
+        if is_add:
+            ok, msg, bal = self.economy.add(target, amount, reason, "", MAX_ADD)
+        else:
+            ok, msg, bal, _ = self.economy.spend(target, amount, reason, "")
+        if not ok:
+            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {msg}**"]))
+            return
+        _log.warning("[喵币%d] %s %s %d（原因：%s）→ 余额 %s",
+                     1 if is_add else 2, self._disp(gid, user_openid), label, amount, reason, bal)
+        await self._reply_markdown(message, "\n".join([
+            title, "", f"**✅ 已{label}**", "",
+            f"- 玩家：**{target}**", f"- 数量：{amount}",
+            f"- 原因：{reason}", f"- 变动后余额：**{bal}**",
+        ]))
+
+    async def cmd_econ_reset(self, message, text: str, gid, user_openid: str = ""):
+        """重置经济 确认：把所有喵币余额清零（保留流水，高级管理员）"""
+        title = self.build_card_title("重置经济")
+        if "确认" not in text:
+            await self._reply_markdown(message, "\n".join([
+                title, "", "**⚠️ 会把所有人的喵币余额清零（流水保留）**", "",
+                "> 确认请发送：`重置经济 确认`",
+            ]))
+            return
+        n = self.economy.reset_all()
+        _log.warning("[喵币] %s 执行了重置经济，影响 %s 个账号", self._disp(gid, user_openid), n)
+        await self._reply_markdown(message, "\n".join([
+            title, "", f"**✅ 已清零 {n} 个账号的喵币**", "> 历史流水保留，可用 `账单` 查看",
+        ]))
+
     async def cmd_backup_list(self, message, text: str, gid, user_openid: str = ""):
         """备份列表 [序号]：列出服务器上的备份（编号/时间/大小），编号供 回退备份 使用"""
         title = self.build_card_title("备份列表")
@@ -3484,6 +3715,15 @@ class GroupReviewClient(botpy.Client):
                 await self._vote_tick()
             except Exception as e:
                 _log.exception("种子投票调度出错: %s", e)
+            # 喵币：冻结超过 7 天的账号清零（每 6 小时扫一次，条件天然幂等）
+            if time.time() - self._econ_clear_ts > 6 * 3600:
+                self._econ_clear_ts = time.time()
+                try:
+                    _n = self.economy.clear_frozen(7)
+                    if _n:
+                        _log.info("喵币：已清零 %d 个冻结超过 7 天的账号", _n)
+                except Exception as e:
+                    _log.warning("喵币冻结清零失败: %s", e)
             try:
                 await self._server_status_tick()
             except Exception as e:

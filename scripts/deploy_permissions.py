@@ -44,6 +44,7 @@ files = [
     (os.path.join(BOT_DIR, "lexicon_render.py"), "C:/bot/lexicon_render.py"),
     (os.path.join(BOT_DIR, "seeds.py"), "C:/bot/seeds.py"),
     (os.path.join(BOT_DIR, "seed_render.py"), "C:/bot/seed_render.py"),
+    (os.path.join(BOT_DIR, "economy_store.py"), "C:/bot/economy_store.py"),
     (os.path.join(BOT_DIR, "github_monitor.py"), "C:/bot/github_monitor.py"),
     (os.path.join(BOT_DIR, "card_render.py"), "C:/bot/card_render.py"),
 ]

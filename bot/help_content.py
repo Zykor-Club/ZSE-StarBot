@@ -14,7 +14,7 @@ from permissions import (
     PERM_ROLE_MANAGE, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW,
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_MAP_FETCH, PERM_SAY_ALL, PERM_EXEC, PERM_BROADCAST,
     PERM_VOTE_MANAGE, PERM_VOTE_PUSH, PERM_RESET, PERM_PROGRESS_NOTIFY, PERM_STATUS_NOTIFY,
-    PERM_VOTE_PROPOSAL_DEL, PERM_BACKUP, PERM_WORLD_SETTINGS, PERM_BACKUP_RESTORE,
+    PERM_VOTE_PROPOSAL_DEL, PERM_BACKUP, PERM_WORLD_SETTINGS, PERM_BACKUP_RESTORE, PERM_ECON_ADMIN,
 )
 
 # ───────────────────────── 分类与指令 ─────────────────────────
@@ -103,6 +103,12 @@ CATEGORIES = [
         "commands": [
             ("查背包", "<序号> [玩家名]", "查看背包 / 查询背包 / 背包", None, "渲染背包图片；省略玩家名=查自己"),
             ("排行", "<序号> <项目> [参数] [页码]", "", None, "排行榜：死亡 / 在线 / 钓鱼 / 金币 / boss（图片卡分页）"),
+            ("签到", "[玩家名]", "", None, "每日签到领喵币（需已绑定白名单；15~35 + 连续奖励）"),
+            ("我的积分", "[玩家名]", "", None, "喵币余额 / 累计 / 连续签到 / 排名"),
+            ("积分排行", "[累计] [页码]", "", None, "本联合体系内已绑定玩家的喵币榜"),
+            ("账单", "[页码]", "", None, "自己的喵币流水"),
+            ("发币 / 扣币", "<玩家名> <数量> [原因]", "", PERM_ECON_ADMIN, "高级管理员发放/扣除喵币"),
+            ("重置经济", "确认", "", PERM_ECON_ADMIN, "清零所有人喵币（保留流水）"),
         ],
     },
     {
