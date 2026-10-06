@@ -3221,6 +3221,32 @@ class GroupReviewClient(botpy.Client):
             f"- 存档文件：`{zip_name}`" + closed_note + self._vote_failed_line(failed))
 
     # ───────────────────────── 喵币（签到 / 积分 / 排行 / 账单） ─────────────────────────
+    def _econ_bound_openids(self, gid) -> set:
+        """本联合体系内已绑定白名单的 openid 集合（榜单过滤用）"""
+        out = set()
+        for sg in sorted(self.registry.zone_gids(gid)):
+            for rec in (self.whitelist_store._data.get(sg, {}) or {}).values():
+                oid = (rec or {}).get("bind_openid") or ""
+                if oid:
+                    out.add(oid)
+        return out
+
+    def _econ_openid_of_name(self, gid, name: str) -> str:
+        """按玩家名反查绑定人 openid（本联合体系内）"""
+        for sg in sorted(self.registry.zone_gids(gid)):
+            rec = self.whitelist_store.get_record(sg, name)
+            if rec and rec.get("bind_openid"):
+                return rec["bind_openid"]
+        return ""
+
+    def _econ_all_my_names(self, user_openid: str) -> list:
+        """在全部已知群里找该 openid 绑定的玩家名（查看类用）"""
+        out = []
+        for sg, recs in list((self.whitelist_store._data or {}).items()):
+            for nm, rec in (recs or {}).items():
+                if (rec or {}).get("bind_openid") == user_openid and nm not in out:
+                    out.append(nm)
+        return out
     def _econ_bound_names(self, gid) -> list:
         """本联合体系内已绑定白名单的玩家名（积分排行过滤用）"""
         names = []
@@ -3243,7 +3269,7 @@ class GroupReviewClient(botpy.Client):
         """机器人侧按北京时间（UTC+8）算自然日"""
         return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
 
-    def _econ_pick(self, gid, user_openid: str, want: str):
+    def _econ_pick(self, gid, user_openid: str, want: str, strict: bool = True):
         """选定要操作的玩家名；返回 (name, err)"""
         names = self._econ_my_names(gid, user_openid)
         if want:
@@ -3271,9 +3297,9 @@ class GroupReviewClient(botpy.Client):
         today = self._econ_today()
         base = random.randint(SIGN_BASE[0], SIGN_BASE[1])
         bonus = random.randint(SIGN_BONUS[0], SIGN_BONUS[1])
-        ok, msg, bal, streak, amt, extra = self.economy.sign(name, today, base, bonus)
+        ok, msg, bal, streak, amt, extra = self.economy.sign(user_openid, today, base, bonus, name)
         if not ok:
-            row = self.economy.get(name)
+            row = self.economy.get(user_openid)
             await self._reply_markdown(message, "\n".join([
                 title, "", f"**{msg}**", "",
                 f"> 余额：**{row['balance']}** 喵币｜连续 **{row['streak']}** 天",
@@ -3284,7 +3310,7 @@ class GroupReviewClient(botpy.Client):
             lines.append(f"- 其中连续/里程碑奖励：**+{extra}**")
         lines += [f"- 连续签到：**{streak}** 天",
                   f"- 当前余额：**{bal}** 喵币",
-                  f"- 余额排名：第 **{self.economy.rank_of(name)}** 名",
+                  f"- 余额排名：第 **{self.economy.rank_of(user_openid)}** 名",
                   "", f"> 自然日按北京时间算：{today}"]
         await self._reply_markdown(message, "\n".join(lines))
 
@@ -3297,7 +3323,7 @@ class GroupReviewClient(botpy.Client):
         if err:
             await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
             return
-        row = self.economy.get(name)
+        row = self.economy.get(user_openid)
         lines = [title, "", f"**{name}**", "",
                  f"- 喵币余额：**{row['balance']}**",
                  f"- 累计获取：{row['total_earned']}｜累计消费：{row['total_spent']}"]
@@ -3305,7 +3331,7 @@ class GroupReviewClient(botpy.Client):
             lines.append(f"- 连续签到：**{row['streak']}** 天（上次 {row['last_sign_date']}）")
         else:
             lines.append("- 连续签到：还没签到过")
-        lines.append(f"- 排名：余额第 **{self.economy.rank_of(name)}** 名｜累计第 **{self.economy.rank_of(name, 'earned')}** 名")
+        lines.append(f"- 排名：余额第 **{self.economy.rank_of(user_openid)}** 名｜累计第 **{self.economy.rank_of(user_openid, 'earned')}** 名")
         if row.get("frozen_at"):
             lines.append("> ⚠️ 该账号因退群处于冻结状态（7 天后清零）")
         if row["last_sign_date"] != self._econ_today():
@@ -3324,7 +3350,7 @@ class GroupReviewClient(botpy.Client):
             return
         page = max(1, page)
         per = 10
-        rows = self.economy.logs(name, (page - 1) * per, per)
+        rows = self.economy.logs(user_openid, (page - 1) * per, per)
         if not rows:
             await self._reply_markdown(message, "\n".join([title, "", f"**{name}** 还没有任何喵币流水喵"]))
             return
@@ -3347,7 +3373,7 @@ class GroupReviewClient(botpy.Client):
         # 取前 200 名后在本地按"本联合体系已绑定白名单"过滤（账本是账号级，榜单是视图）
         rows = self.economy.top(by, 0, 200)
         bound = set(self._econ_bound_names(gid))
-        rows = [r for r in rows if r["account"] in bound]
+        rows = [r for r in rows if r["name"] in bound]
         per = 20
         page_rows = rows[(page - 1) * per: page * per]
         if not page_rows:
