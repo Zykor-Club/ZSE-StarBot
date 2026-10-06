@@ -769,10 +769,10 @@ class GroupReviewClient(botpy.Client):
         if low.startswith("签到"):  # 签到 [玩家名]（需已绑定白名单）
             await self.cmd_sign(message, text, gid, user_openid)
             return
-        if low.startswith(("我的积分", "我的喵币")):
+        if low.startswith(("我的信息", "我的积分", "我的喵币")):
             await self.cmd_my_points(message, text, gid, user_openid)
             return
-        if low.startswith("积分排行"):
+        if low.startswith(("积分排行", "签到排行", "喵币排行")):
             await self.cmd_points_rank(message, text, gid, user_openid)
             return
         if low.startswith("账单"):
@@ -3319,7 +3319,8 @@ class GroupReviewClient(botpy.Client):
     async def cmd_my_points(self, message, text: str, gid, user_openid: str = ""):
         """我的积分 [玩家名]：余额 / 累计 / 连续 / 排名"""
         title = self.build_card_title("我的积分")
-        rest = text[len("我的积分"):].lstrip("：: \t").strip()
+        _mp = next((p for p in ("我的信息", "我的积分", "我的喵币") if text.startswith(p)), "我的信息")
+        rest = text[len(_mp):].lstrip("：: \t").strip()
         want = rest.split()[0] if rest.split() else ""
         name, err = self._econ_pick(gid, user_openid, want)
         if err:
@@ -3368,7 +3369,8 @@ class GroupReviewClient(botpy.Client):
     async def cmd_points_rank(self, message, text: str, gid, user_openid: str = ""):
         """积分排行 [累计] [页码]：本联合体系内已绑定白名单玩家的榜单"""
         title = self.build_card_title("积分排行")
-        rest = text[len("积分排行"):].lstrip("：: \t").strip()
+        _rp = next((p for p in ("积分排行", "签到排行", "喵币排行") if text.startswith(p)), "积分排行")
+        rest = text[len(_rp):].lstrip("：: \t").strip()
         by = "earned" if ("累计" in rest or "earned" in rest.lower()) else "balance"
         toks = [t for t in rest.split() if t.isdigit()]
         page = max(1, int(toks[0]) if toks else 1)

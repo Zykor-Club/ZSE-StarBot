@@ -98,6 +98,22 @@ class EconomyStore:
         c.execute("INSERT OR IGNORE INTO economy(openid, updated_at) VALUES(?, ?)",
                   (openid, int(time.time())))
 
+    def today_rank(self, openid: str, day_start_ts: int) -> int:
+        """今天第几个签到（按 UTC+8 自然日的流水顺序）"""
+        with self._conn() as c:
+            row = c.execute("SELECT id FROM economy_log WHERE openid=? AND reason LIKE 'sign:%' "
+                            "AND ts >= ? ORDER BY id ASC LIMIT 1", (openid, int(day_start_ts))).fetchone()
+            if row is None:
+                return 0
+            return int(c.execute("SELECT COUNT(*) FROM economy_log WHERE reason LIKE 'sign:%' "
+                                 "AND ts >= ? AND id <= ?", (int(day_start_ts), row["id"])).fetchone()[0])
+
+    def last_sign_ts(self, openid: str) -> int:
+        with self._conn() as c:
+            r = c.execute("SELECT ts FROM economy_log WHERE openid=? AND reason LIKE 'sign:%' "
+                          "ORDER BY id DESC LIMIT 1", (openid,)).fetchone()
+            return int(r["ts"]) if r else 0
+
     def rank_of(self, openid: str, by: str = "balance") -> int:
         col = "total_earned" if by == "earned" else "balance"
         with self._conn() as c:
@@ -111,7 +127,7 @@ class EconomyStore:
         col = "total_earned" if by == "earned" else "balance"
         with self._conn() as c:
             rows = c.execute(
-                f"SELECT openid, balance, total_earned, streak, frozen_at FROM economy "
+                f"SELECT openid, name, balance, total_earned, streak, frozen_at FROM economy "
                 f"ORDER BY {col} DESC, updated_at ASC LIMIT ? OFFSET ?", (int(limit), int(offset))).fetchall()
             return [dict(r) for r in rows]
 
