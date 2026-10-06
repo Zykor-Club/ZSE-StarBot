@@ -3379,6 +3379,24 @@ class GroupReviewClient(botpy.Client):
             await self._reply_markdown(message, "\n".join([title, "", f"**❌ {err}**"]))
             return
         row = self.economy.get(user_openid)
+        # 图片卡（渲染/发送失败则回落到下面的文字卡）
+        try:
+            _send_gid = gid or (getattr(message, "group_openid", None) or "")
+            _state = ("今天已签到（" + str(row.get("last_sign_date") or "") + "）"
+                      if row.get("last_sign_date") == self._econ_today() else "今天还没签到")
+            _rows = self._econ_info_rows(
+                gid, name, int(row.get("total_earned") or 0), _state, int(row.get("streak") or 0),
+                self.economy.last_sign_ts(user_openid), self.economy.today_rank(user_openid, self._econ_day_start()))
+            _rows.insert(3, ("喵币余额", str(row.get("balance") or 0)))
+            _rows.insert(4, ("累计消费", str(row.get("total_spent") or 0)))
+            _png = render_info_card("我的信息", _rows, subtitle=name,
+                                    footer="starZSEbot · 喵币", bg_dir=self._vote_bg_dir())
+            if _png:
+                await send_group_image(self, _send_gid, _png, filename="myinfo.jpg",
+                                       msg_id=getattr(message, "id", None))
+                return
+        except Exception as e:
+            _log.warning("我的信息卡渲染/发送失败，回落文字卡: %s", e)
         lines = [title, "", f"**{name}**", "",
                  f"- 喵币余额：**{row['balance']}**",
                  f"- 累计获取：{row['total_earned']}｜累计消费：{row['total_spent']}"]
