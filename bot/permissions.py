@@ -74,7 +74,8 @@ PERM_VOTE_PROPOSAL_DEL = "vote_proposal_del"  # 删除提案（管理员及以�
 PERM_BACKUP = "backup"  # 存档备份（管理员及以上）
 PERM_WORLD_SETTINGS = "world_settings"  # 修改世界设置（管理员及以上）
 PERM_BACKUP_RESTORE = "backup_restore"  # 回退备份（服主及以上，会覆盖玩家存档）
-PERM_ECON_ADMIN = "econ_admin"  # 喵币管理：发币/扣币/重置（高级管理员）
+PERM_ECON_ADMIN = "econ_admin"
+PERM_MAIL_RESET = "mail_reset"    # 重置某邮箱的申请上限（管理员及以上）  # 喵币管理：发币/扣币/重置（高级管理员）
 
 MIN_ROLE = {
     PERM_MAP_FETCH: MEMBER,        # member 直接通过，但群未开放时在 check 内拦截
@@ -86,6 +87,7 @@ MIN_ROLE = {
     PERM_WORLD_SETTINGS: ADMIN,
     PERM_BACKUP_RESTORE: MASTER,
     PERM_ECON_ADMIN: OWNER,
+    PERM_MAIL_RESET: ADMIN,
     PERM_ADD_SERVER: MASTER,
     PERM_DEL_SERVER: MASTER,       # 归属（是否本人添加）在校验处单独判断
     PERM_EXEC: ADMIN,

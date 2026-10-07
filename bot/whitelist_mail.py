@@ -151,6 +151,24 @@ class VerifyManager:
         except OSError as e:
             print(f"[whitelist] 保存 verify.json 失败: {e}")
 
+    # ────────────── 上限重置（管理员指令用） ──────────────
+    def reset_email_limit(self, email: str) -> tuple:
+        """清零某邮箱的申请计数与冷却。返回 (ok, msg)。
+
+        注意：必须同时改内存与落盘 —— 只改 verify.json 文件会被内存副本覆盖回去。
+        """
+        email = (email or "").strip().lower()
+        if not email:
+            return False, "请提供 QQ 号"
+        rec = self._verify_email.get(email)
+        if not rec:
+            return False, "该邮箱没有申请记录"
+        old = int(rec.get("sent_count", 0) or 0)
+        rec["sent_count"] = 0
+        rec["last_sent"] = 0
+        self._save_verify()
+        return True, "已重置（原计数 %d）" % old
+
     # ────────────── 申请验证码 ──────────────
     def request_code(self, user_openid: str, email: str, group_name: str, bot_name: str) -> tuple[bool, str, str]:
         """申请并发送验证码。返回 (ok, msg, code)。
@@ -730,7 +748,7 @@ class ChangeStore:
     """白名单变更事务（改名限流 + 邮箱改绑）：
       - 修改玩家名：成功后记录时间，48 小时内不得再次修改
       - 邮箱改绑：开始时原白名单立即作废（备份旧记录）；24 小时内用新邮箱重新走
-        「绑定邮箱 → 添加白名单」才算改绑成功；超时未完成由 sweep 自动恢复原白名单；
+        「绑定 → 添加白名单」才算改绑成功；超时未完成由 sweep 自动恢复原白名单；
         每 7 天限一次（按发起时间计）
     数据文件 whitelist_changes.json：
       {

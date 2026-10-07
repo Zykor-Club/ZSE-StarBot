@@ -47,6 +47,7 @@ files = [
     (os.path.join(BOT_DIR, "economy_store.py"), "C:/bot/economy_store.py"),
     (os.path.join(BOT_DIR, "whitelist_users.py"), "C:/bot/whitelist_users.py"),
     (os.path.join(BOT_DIR, "econ_render.py"), "C:/bot/econ_render.py"),
+    (os.path.join(BOT_DIR, "bind_rules.py"), "C:/bot/bind_rules.py"),
     (os.path.join(BOT_DIR, "github_monitor.py"), "C:/bot/github_monitor.py"),
     (os.path.join(BOT_DIR, "card_render.py"), "C:/bot/card_render.py"),
 ]

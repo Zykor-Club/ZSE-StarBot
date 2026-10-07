@@ -101,9 +101,35 @@ import lexicon
 from lexicon import Lexicon
 from lexicon_render import render_lexicon_card
 from server_status_store import ServerStatusStore
+from bind_rules import check_bind_request, normalize_email, is_valid_qq_email
 from economy_store import EconomyStore, SIGN_BASE, SIGN_BONUS, MAX_ADD
 
 # 在线奖励：每满 1 小时发放的喵币数
+def _find_account_items(obj, depth: int = 0):
+    """在回包里递归找出"账号-秒数"列表：兼容任意外层结构与字段名（account/name）"""
+    if depth > 4:
+        return None
+    if isinstance(obj, list):
+        if obj and isinstance(obj[0], dict) and ("account" in obj[0] or "name" in obj[0]):
+            return obj
+        for x in obj:
+            r = _find_account_items(x, depth + 1)
+            if r:
+                return r
+        return None
+    if isinstance(obj, dict):
+        for k in ("items", "data", "payload", "list", "rows"):
+            if k in obj:
+                r = _find_account_items(obj[k], depth + 1)
+                if r:
+                    return r
+        for v in obj.values():
+            r = _find_account_items(v, depth + 1)
+            if r:
+                return r
+    return None
+
+
 PLAYTIME_PER_HOUR = 3
 PLAYTIME_PER_CYCLE_MAX = 12
 from whitelist_users import WhitelistUsers
@@ -111,6 +137,7 @@ from econ_render import render_info_card, render_rank_card
 from seeds import Seeds
 from seed_render import render_seed_list_card
 from permissions import (
+    PERM_MAIL_RESET,
     PermissionManager,
     OWNER, MASTER, ADMIN, MEMBER, RANK,
     ROLE_ALIAS, PERM_NEED_LABEL, role_label,
@@ -780,8 +807,8 @@ class GroupReviewClient(botpy.Client):
         if low.startswith(("我的信息", "我的积分", "我的喵币")):
             await self.cmd_my_points(message, text, gid, user_openid)
             return
-        _log.info("DISPATCH_RANK")
         if low.startswith(("积分排行", "签到排行", "喵币排行")):
+            _log.info("DISPATCH_RANK_MATCH")
             await self.cmd_points_rank(message, text, gid, user_openid)
             return
         if low.startswith(("发币", "扣币")):
@@ -889,8 +916,10 @@ class GroupReviewClient(botpy.Client):
             await self.cmd_progress_query(message, text, gid, user_openid)
             return
 
-        if low.startswith("绑定邮箱"):  # 绑定邮箱 <邮箱>
+        # 绑定 <QQ号>：与"绑定邮箱"同一实现（免输入 @ 符号，避开平台过滤）
+        if low.startswith("绑定"):
             await self.cmd_bind_email(message, text, gid)
+            return
             return
         if low.startswith("添加白名单"):  # 添加白名单 <进服玩家名> <验证码>
             await self.cmd_add_whitelist(message, text, gid)
@@ -900,6 +929,11 @@ class GroupReviewClient(botpy.Client):
             return
         if low.startswith(("邮箱改绑", "改绑邮箱")):  # 邮箱改绑 <新邮箱>：改绑绑定邮箱（7 天限一次；24 小时内完成，否则回滚）
             await self.cmd_change_email(message, text, gid)
+            return
+        if low.startswith("邮箱上限重置"):  # 邮箱上限重置 <QQ号>（管理员及以上）
+            if not await self._perm_ok(message, gid, user_openid, PERM_MAIL_RESET, "邮箱上限重置"):
+                return
+            await self.cmd_mail_limit_reset(message, text, gid, user_openid)
             return
         if low.startswith("登录"):  # 登录 [玩家名]：批准换设备登录
             await self.cmd_login(message, text, gid)
@@ -1842,7 +1876,7 @@ class GroupReviewClient(botpy.Client):
                     message,
                     "## ꧁༺ 查询背包 ༻꧂\n\n"
                     "**❌ 您还未绑定白名单，无法反查玩家名喵**\n\n"
-                    "> 可发 `绑定邮箱 <邮箱>` 按提示绑定，或指定玩家名：`查背包 <序号> <玩家名>`",
+                    "> 可发 `绑定 <QQ号>` 按提示绑定，或指定玩家名：`查背包 <序号> <玩家名>`",
                 )
                 return
         elif not check_name_ok(player):
@@ -1941,7 +1975,7 @@ class GroupReviewClient(botpy.Client):
             await self._reply_markdown(message, "\n".join([
                 self.build_card_title("自踢"), "",
                 "**❌ 您还未绑定白名单，无法自踢喵...**", "",
-                "> 先发 `绑定邮箱 <邮箱>` 按提示添加白名单",
+                "> 先发 `绑定 <QQ号>` 按提示添加白名单",
             ]))
             return
         sent = await self.zse_server.send_self_kick(gid, name)
@@ -3434,7 +3468,7 @@ class GroupReviewClient(botpy.Client):
                         f"> 你绑定的是：{('、'.join(names) if names else '（无）')}")
         if not names:
             return "", ("还没有绑定白名单喵，签到需要先绑定\n"
-                        "> `绑定邮箱 <邮箱>` → 游戏内取验证码 → `添加白名单 <玩家名> <验证码>`")
+                        "> `绑定 <QQ号>` → 邮箱里收到的验证码 → `添加白名单 <玩家名> <验证码>`")
         if len(names) > 1:
             return "", (f"你绑定了多个玩家名，请指定一个：\n> {('、'.join(names))}\n"
                         "> 用法：`签到 <玩家名>`")
@@ -3473,6 +3507,7 @@ class GroupReviewClient(botpy.Client):
                 self.economy.last_sign_ts(user_openid), self.economy.today_rank(user_openid, self._econ_day_start()))
             _png = render_info_card(
                 name, _rows,
+                avatar_bytes=await self._econ_avatar_bytes(user_openid),
                 banner="签到成功  ·  +" + str(amt) + " 喵币",
                 subtitle=self._econ_email(gid, name) + " · " + today,
                 badges=[("连续签到第 " + str(streak) + " 天", "gold"),
@@ -3511,7 +3546,7 @@ class GroupReviewClient(botpy.Client):
                 await self._reply_markdown(message, "\n".join([
                     title, "",
                     "**还没有绑定白名单喵**",
-                    "> `绑定邮箱 <邮箱>` → 游戏内取验证码 → `添加白名单 <玩家名> <验证码>`",
+                    "> `绑定 <QQ号>` → 邮箱里收到的验证码 → `添加白名单 <玩家名> <验证码>`",
                 ]))
                 return
             name = _names[0]   # 钱包按人（openid）算，多个名字取第一个即可
@@ -3641,346 +3676,6 @@ class GroupReviewClient(botpy.Client):
         lines.append("> 翻页：`积分排行 " + str(page + 1) + "`" + ("｜切换：`积分排行`" if by_play else "｜切换：`积分排行 在线`"))
         await self._reply_markdown(message, "\n".join(lines))
 
-    async def cmd_econ_grant(self, message, text: str, gid, user_openid: str = ""):
-        """发币 <玩家名> <数量> [原因] / 扣币 <玩家名> <数量> [原因]（高级管理员）"""
-        is_add = text.startswith("发币")
-        label = "发币" if is_add else "扣币"
-        title = self.build_card_title(label)
-        parts = text[len(label):].lstrip("：: \t").split()
-        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-            await self._reply_markdown(message, "\n".join([
-                title, "", f"**格式：** `{label} <玩家名> <数量> [原因]`", "",
-                f"> 例：`{label} 星梦 100 活动奖励`",
-            ]))
-            return
-        target, amount = parts[0], int(parts[1])
-        reason = " ".join(parts[2:]) or ("admin_grant" if is_add else "admin_deduct")
-        if amount <= 0:
-            await self._reply_markdown(message, "\n".join([title, "", "**数量必须为正喵**"]))
-            return
-        bound = set(self._econ_bound_names(gid))
-        if target not in bound:
-            await self._reply_markdown(message, "\n".join([
-                title, "", f"**❌ `{target}` 不在本联合体系的白名单里喵**",
-                "> 为避免打错名字发错人，只能对本联合体系内已绑定的玩家操作",
-            ]))
-            return
-        if is_add:
-            ok, msg, bal = self.economy.add(target, amount, reason, "", MAX_ADD)
-        else:
-            ok, msg, bal, _ = self.economy.spend(target, amount, reason, "")
-        if not ok:
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {msg}**"]))
-            return
-        _log.warning("[喵币%d] %s %s %d（原因：%s）→ 余额 %s",
-                     1 if is_add else 2, self._disp(gid, user_openid), label, amount, reason, bal)
-        await self._reply_markdown(message, "\n".join([
-            title, "", f"**✅ 已{label}**", "",
-            f"- 玩家：**{target}**", f"- 数量：{amount}",
-            f"- 原因：{reason}", f"- 变动后余额：**{bal}**",
-        ]))
-
-    async def cmd_econ_reset(self, message, text: str, gid, user_openid: str = ""):
-        """重置经济 确认：把所有喵币余额清零（保留流水，高级管理员）"""
-        title = self.build_card_title("重置经济")
-        if "确认" not in text:
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**⚠️ 会把所有人的喵币余额清零（流水保留）**", "",
-                "> 确认请发送：`重置经济 确认`",
-            ]))
-            return
-        n = self.economy.reset_all()
-        _log.warning("[喵币] %s 执行了重置经济，影响 %s 个账号", self._disp(gid, user_openid), n)
-        await self._reply_markdown(message, "\n".join([
-            title, "", f"**✅ 已清零 {n} 个账号的喵币**", "> 历史流水保留，可用 `账单` 查看",
-        ]))
-
-    async def cmd_backup_list(self, message, text: str, gid, user_openid: str = ""):
-        """备份列表 [序号]：列出服务器上的备份（编号/时间/大小），编号供 回退备份 使用"""
-        title = self.build_card_title("备份列表")
-        rest = text[len("备份列表"):].lstrip("：: \t").strip()
-        if rest.startswith("列表"):
-            rest = rest[len("列表"):].strip()
-        seq, _tail = parse_server_index(rest)
-        seq = seq or 1
-        rec = self._vote_server(gid, seq)
-        if rec is None:
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
-            return
-        server_code = self._vote_server_code(rec)
-        if not server_code:
-            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
-            return
-        ok, data = await self.zse_server.request_archive_export(
-            server_code, action="list", timeout=60)
-        if not ok or not isinstance(data, dict) or data.get("error"):
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**❌ 读取备份列表失败喵...**", "",
-                f"> 原因：{self._reason_of(data)}",
-                "> 若提示不支持的包类型，请让服主更新 starZSEbot 插件",
-            ]))
-            return
-        items = data.get("items") or []
-        _log.info("备份列表请求 server=%s 返回 keys=%s items=%d",
-                  (server_code or "")[:8], list((data or {}).keys()), len(items))
-        if not items:
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**还没有任何备份喵...**", "",
-                "> 插件会每 30 分钟自动备份一次（配置项：自动备份间隔小时 / 备份保留份数）",
-            ]))
-            return
-        lines = [title, "", f"**共 {len(items)} 份备份**（新 → 旧）", ""]
-        for it in items[:25]:
-            size = float(it.get("size") or 0) / 1024 / 1024
-            lines.append(f"- `{int(it.get('no') or 0):>2}`  {it.get('time')}  ·  {size:.1f} MB")
-        if len(items) > 25:
-            lines.append(f"> 仅显示最近 25 份（共 {len(items)} 份）")
-        lines += ["", f"> 回退：`回退备份 {seq} <编号>`（服主+，会把备份里的玩家存档导入覆盖）",
-                  "> 自动备份：默认每 30 分钟一次"]
-        await self._reply_markdown(message, "\n".join(lines))
-
-    async def cmd_backup_restore(self, message, text: str, gid, user_openid: str = ""):
-        """回退备份 <序号> <备份编号>：把该备份里的玩家存档重新导入覆盖（服主及以上）"""
-        title = self.build_card_title("回退备份")
-        cmd = "回退备份" if "回退备份" in text else "还原备份"
-        rest = text[len(cmd):].lstrip("：: \t").strip()
-        seq, tail = parse_server_index(rest)
-        toks = (tail or "").split()
-        no = int(toks[0]) if toks and toks[0].isdigit() else None
-        if seq is None or no is None:
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**格式：** `回退备份 <服务器序号> <备份编号>`", "",
-                "> 备份编号见 `备份列表 <序号>`",
-                "> 例：`回退备份 1 3`（把第 3 份备份里的玩家存档导入覆盖）",
-            ]))
-            return
-        rec = self._vote_server(gid, seq)
-        if rec is None:
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
-            return
-        server_code = self._vote_server_code(rec)
-        if not server_code:
-            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
-            return
-        ok, data = await self.zse_server.request_archive_export(
-            server_code, action="list", timeout=60)
-        items = (data or {}).get("items") if isinstance(data, dict) else None
-        if not ok or not items:
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**❌ 读取备份列表失败喵...**",
-                f"> 原因：{self._reason_of(data)}",
-            ]))
-            return
-        target = next((it for it in items if int(it.get("no") or -1) == no), None)
-        if target is None:
-            await self._reply_markdown(message, "\n".join([
-                title, "", f"**❌ 没有编号 {no} 的备份喵...**",
-                f"> 当前共 {len(items)} 份，用 `备份列表 {seq}` 查看编号",
-            ]))
-            return
-        ok2, d2 = await self.zse_server.request_archive_export(
-            server_code, action="restore", file=target.get("name") or "", timeout=300)
-        if not ok2 or not isinstance(d2, dict) or d2.get("error"):
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**❌ 回退失败喵...**", "",
-                f"> 备份：`{target.get('name')}`",
-                f"> 原因：{self._reason_of(d2)}",
-            ]))
-            return
-        restored = d2.get("restored") or []
-        skipped = d2.get("skipped") or []
-        lines = [title, "", "**✅ 回退完成**", "",
-                 f"- 备份：`{d2.get('file') or target.get('name')}`  （{target.get('time')}）",
-                 f"- 成功导入：**{len(restored)}** 个玩家存档"]
-        if restored:
-            show = "、".join(str(x) for x in restored[:10])
-            lines.append(f"  > {show}" + ("…" if len(restored) > 10 else ""))
-        lines.append(f"- 跳过：{len(skipped)} 个" + (f"（{'、'.join(str(x) for x in skipped[:6])}…）" if skipped else ""))
-        lines += ["", "> 相关在线玩家已被踢下线；重新登录后即为备份里的存档",
-                  "> 若数据看着没变，请确认没有别人随后又保存了角色"]
-        await self._reply_markdown(message, "\n".join(lines))
-
-    async def cmd_world_settings(self, message, text: str, gid, user_openid: str = ""):
-        """世界设置 <序号> [难度 经典|专家|大师|旅行] [大小 小|中|大] [邪恶 腐化|猩红]
-
-        · 只给序号 → 展示当前世界参数 + 下次重置将使用的设置（所有人可看）
-        · 带参数 → 保存设置（管理员及以上），**重置生成新世界时生效**（种子投票出来的世界也按它）
-        · 值与"跟随"（或 默认/清除）→ 恢复为跟随当前世界
-        """
-        title = self.build_card_title("世界设置")
-        rest = text[len("世界设置"):].lstrip("：: \t").strip()
-        seq, tail = parse_server_index(rest)
-        if seq is None:
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**格式：** `世界设置 <服务器序号> [难度] [世界大小] [邪恶]`", "",
-                "> 查看：`世界设置 1`",
-                "> 修改：`世界设置 1 大师 大 猩红`（管理员+，顺序＝难度/大小/邪恶，只写前几项也行）",
-                "> 取值：难度 `经典/专家/大师/旅行`；大小 `小/中/大`；邪恶 `腐化/猩红`",
-                "> 恢复跟随当前世界：对应位置填 `跟随`",
-            ]))
-            return
-        rec = self._vote_server(gid, seq)
-        if rec is None:
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
-            return
-        server_code = self._vote_server_code(rec)
-        if not server_code:
-            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
-            return
-        toks = (tail or "").split()
-        keymap = {"难度": "difficulty", "大小": "size", "世界大小": "size", "尺寸": "size",
-                  "邪恶": "evil", "环境": "evil", "邪恶环境": "evil", "邪恶地形": "evil"}
-        pairs = {}
-        if toks:
-            if toks[0] in keymap:
-                # 键值式（也支持）：世界设置 1 难度 大师 大小 大 邪恶 猩红
-                i = 0
-                while i < len(toks):
-                    key = keymap.get(toks[i])
-                    if key is None or i + 1 >= len(toks):
-                        await self._reply_markdown(message, "\n".join([
-                            title, "", "**❌ 参数格式不对喵...**", "",
-                            "> 格式：`世界设置 <序号> [难度] [世界大小] [邪恶]`",
-                            "> 例：`世界设置 1 大师 大 猩红`",
-                        ]))
-                        return
-                    val = toks[i + 1]
-                    pairs[key] = "" if val in ("跟随", "默认", "清除", "不变", "默认值") else val
-                    i += 2
-            else:
-                # 位置式（推荐）：世界设置 1 大师 大 猩红 = 难度 / 世界大小 / 邪恶（可只写前几项）
-                for key, val in zip(("difficulty", "size", "evil"), toks[:3]):
-                    pairs[key] = "" if val in ("跟随", "默认", "清除", "不变", "默认值", "-") else val
-                if len(toks) > 3:
-                    await self._reply_markdown(message, "\n".join([
-                        title, "", "**❌ 参数太多了喵...**", "",
-                        "> `世界设置 <序号> [难度] [世界大小] [邪恶]`",
-                        "> 例：`世界设置 1 大师 大 猩红`（只写前两项也行）",
-                    ]))
-                    return
-            if not await self._perm_ok(message, gid, user_openid, PERM_WORLD_SETTINGS, "世界设置"):
-                return
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**❌ 读取/保存世界设置失败喵...**", "",
-                f"> 原因：{self._reason_of(data)}",
-                "> 若提示不支持的包类型，请让服主更新 starZSEbot 插件",
-            ]))
-            return
-        if data.get("error"):
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ {data.get('error')}**"]))
-            return
-        lines = [title, ""]
-        if pairs:
-            lines += ["**✅ 地图设置已保存（下次重置生成新世界时生效）**", ""]
-        lines += [
-            f"**当前世界**：{data.get('world_name') or '—'}",
-            f"- 难度：**{data.get('difficulty') or '—'}**",
-            f"- 世界大小：**{data.get('size') or '—'}**（{data.get('max_x') or '?'}×{data.get('max_y') or '?'}）",
-            f"- 邪恶环境：**{data.get('evil') or '—'}**",
-        ]
-        seed = str(data.get("text_seed") or data.get("seed") or "").strip()
-        if seed:
-            lines.append(f"- 当前种子：`{_md_safe(seed)}`")
-        lines.append(f"- 困难模式：{'是' if data.get('hardmode') else '否'}")
-        lines += ["", "**下次重置将使用**（种子投票获胜时也一样，只有种子由投票决定）"]
-        for label, key in (("难度", "set_difficulty"), ("世界大小", "set_size"), ("邪恶环境", "set_evil")):
-            val = str(data.get(key) or "").strip()
-            lines.append(f"- {label}：**{_md_safe(val)}**" if val else f"- {label}：跟随当前世界")
-        lines += ["", "> 修改：`世界设置 %d 大师 大 猩红`（顺序＝难度/大小/邪恶）" % seq,
-                  "> 恢复跟随：对应位置填 `跟随`"]
-        await self._reply_markdown(message, "\n".join(lines))
-
-    async def cmd_backup(self, message, text: str, gid, user_openid: str = ""):
-        """备份 [发送] <序号>：把存档打包备份到服务器（加"发送"则额外把 zip 推到本群）"""
-        title = self.build_card_title("备份")
-        rest = text[len("备份"):].lstrip("：: \t").strip()
-        toks = rest.split()
-        send_to_group = bool(toks) and toks[0] in ("发送", "发", "群里", "发到群里")
-        if send_to_group:
-            toks = toks[1:]
-        seq = int(toks[0]) if toks and toks[0].isdigit() else None
-        if seq is None:
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**格式：** `备份 [发送] <服务器序号>`", "",
-                "> `备份 1`：只备份到服务器（推荐，不刷群、快）",
-                "> `备份 发送 1`：备份并把 zip 发到本群（存档大时会很慢）",
-            ]))
-            return
-        rec = self._vote_server(gid, seq)
-        if rec is None:
-            await self._reply_markdown(message, "\n".join([title, "", f"**❌ 找不到序号 {seq} 的服务器喵...**"]))
-            return
-        server_code = self._vote_server_code(rec)
-        if not server_code:
-            await self._reply_markdown(message, "\n".join([title, "", "**❌ 该服务器标识无效喵...**"]))
-            return
-        ok, data = await self.zse_server.request_archive_export(
-            server_code, timeout=300, action="" if send_to_group else "backup")
-        if not ok or not isinstance(data, dict) or data.get("error") or not data.get("name"):
-            await self._reply_markdown(message, "\n".join([
-                title, "", "**❌ 备份失败喵...**", "",
-                f"> 原因：{self._reason_of(data)}",
-                "> 若提示插件版本不支持，请让服主更新 starZSEbot 插件",
-            ]))
-            return
-        name = data.get("name")
-        size = int(data.get("size") or 0)
-        lines = [title, "", "**✅ 存档已备份到服务器**", "",
-                 f"- 文件：`{name}`",
-                 f"- 大小：{size / 1024 / 1024:.1f} MB" if size else "- 大小：—",
-                 "- 位置：`tshock/starZSEBot/Exports/`（按配置自动只保留最近若干份）"]
-        pushed = None
-        if send_to_group:
-            b64 = data.get("base64") or ""
-            if b64:
-                fd, zip_path = tempfile.mkstemp(suffix=".zip")
-                os.close(fd)
-                try:
-                    with open(zip_path, "wb") as f:
-                        f.write(decode_archive_zip(b64))
-                    await send_group_file(self, gid, zip_path, name, file_type=4)
-                    pushed = True
-                except Exception as e:
-                    _log.warning("备份 zip 推送失败: %s", e)
-                    pushed = False
-                finally:
-                    try:
-                        os.remove(zip_path)
-                    except OSError:
-                        pass
-        if send_to_group:
-            lines.append(f"- 已发送到本群：{'是' if pushed else '失败（存档已备份在服务器）'}")
-        await self._reply_markdown(message, "\n".join(lines))
-
-    async def _force_close_vote(self, server_code: str):
-        """强制结束该服务器进行中的投票并结算（发结果卡到联合区）。
-
-        用于 /重置：重置会重建世界，投票结果随即被本次重置采用，
-        所以先把进行中的投票结算掉（`pending_result` 才能取到获胜组合）。
-        返回被结束的投票记录；没有进行中的投票则返回 None。
-        """
-        if not server_code:
-            return None
-        vote = self.votes.get_active(server_code)
-        if not vote:
-            return None
-        vote_id = vote.get("vote_id")
-        async with self._vote_pub_lock:
-            vote = self.votes.get_vote(vote_id)
-            if not vote or vote.get("status") != "open":
-                return None        # 已被 结束投票/调度 结算
-            self.votes.finish_vote(vote_id)
-            vote = self.votes.get_vote(vote_id)
-            try:
-                tally = self.votes.tally(vote_id)
-                await self._publish_vote_card(self._vote_target_gids(vote), vote, tally, "closed")
-            except Exception as e:
-                _log.warning("重置时发布投票结果卡失败: %s", e)
-            self.votes.mark_result_published(vote_id)
-        _log.info("重置触发：已强制结算进行中的投票 %s", vote_id)
-        return vote
-
-    # ───────────────────────── 种子投票后台调度 ─────────────────────────
     async def vote_scheduler(self):
         """后台循环：约 60 秒一轮，扫描 due_updates（重发 open 卡）/ due_closes（自动截止发结果卡）。
         循环内异常必须捕获，不能中断整个调度。"""
@@ -4428,63 +4123,6 @@ class GroupReviewClient(botpy.Client):
         return vote
 
     # ───────────────────────── 种子投票后台调度 ─────────────────────────
-    async def vote_scheduler(self):
-        """后台循环：约 60 秒一轮，扫描 due_updates（重发 open 卡）/ due_closes（自动截止发结果卡）。
-        循环内异常必须捕获，不能中断整个调度。"""
-        _log.info("种子投票调度已启动（间隔 60 秒）")
-        while True:
-            await asyncio.sleep(60)
-            try:
-                await self._vote_tick()
-            except Exception as e:
-                _log.exception("种子投票调度出错: %s", e)
-            # 累计在线时长汇总（各服上报 → 按账号取最大，永不重置）
-            if time.time() - self._playtime_ts > 300:
-                self._playtime_ts = time.time()
-                try:
-                    _pt = {}
-                    for _rec in (self.zse_server.all_records() or []):
-                        _code = _rec.get("code") if isinstance(_rec, dict) else None
-                        if not _code:
-                            continue
-                        _ok, _d = await self.zse_server.request_playtime(_code, timeout=15)
-                        if not _ok:
-                            _log.warning("在线时长请求失败(%s): %s", _code[:8], _d)
-                        _items = (_d or {}).get("items") if isinstance(_d, dict) else None
-                        for _it in (_items or []):
-                            _acc, _sec = (_it or {}).get("account"), int((_it or {}).get("seconds") or 0)
-                            if _acc:
-                                _pt[_acc] = max(_pt.get(_acc, 0), _sec)
-                    if _pt:
-                        self._playtime = _pt
-                except Exception as e:
-                    _log.warning("在线时长汇总失败: %s", e)
-            # 白名单新表回填（第 1 步：只写不读，每 5 分钟一次，幂等 upsert）
-            if time.time() - self._wl_sync_ts > 300:
-                self._wl_sync_ts = time.time()
-                try:
-                    _st = self.whitelist_users.sync(
-                        self.whitelist_store._data,
-                        devices_of=self.whitelist_store._devices)
-                    _log.info("白名单新表回填：用户 %s、设备 %s、城市 %s、无绑定人跳过 %s",
-                              _st["users"], _st["devices"], _st["cities"], _st["skipped_no_openid"])
-                except Exception as e:
-                    _log.warning("白名单新表回填失败: %s", e)
-            # 喵币：冻结超过 7 天的账号清零（每 6 小时扫一次，条件天然幂等）
-            if time.time() - self._econ_clear_ts > 6 * 3600:
-                self._econ_clear_ts = time.time()
-                try:
-                    _n = self.economy.clear_frozen(7)
-                    if _n:
-                        _log.info("喵币：已清零 %d 个冻结超过 7 天的账号", _n)
-                except Exception as e:
-                    _log.warning("喵币冻结清零失败: %s", e)
-            try:
-                await self._server_status_tick()
-            except Exception as e:
-                _log.exception("服务器状态通知出错: %s", e)
-
-    @staticmethod
     def _fmt_secs(sec) -> str:
         try:
             sec = max(0, int(sec))
@@ -4922,45 +4560,63 @@ class GroupReviewClient(botpy.Client):
         others.sort(key=lambda g: (self.registry.join_id_of(g) or 10 ** 9, g))
         return "、".join(f"群ID {self.registry.join_id_of(g) or (g[:8] + '…')}" for g in others)
 
-    async def cmd_bind_email(self, message, text: str, gid):
-        """绑定邮箱 <QQ邮箱>：向该邮箱发送 6 位验证码（5 分钟有效，4 分钟限一次，单邮箱封顶 5 封）
+    async def cmd_mail_limit_reset(self, message, text: str, gid, user_openid: str = ""):
+        """邮箱上限重置 <QQ号>：清零该邮箱的申请计数与冷却（管理员及以上）"""
+        title = self.build_card_title("邮箱上限重置")
+        rest = text[len("邮箱上限重置"):].lstrip("：: \t").strip()
+        if not rest:
+            await self._reply_markdown(message, "\n".join([title, "", "**格式：** `邮箱上限重置 <QQ号>`"]))
+            return
+        email = normalize_email(rest)
+        if not is_valid_qq_email(email):
+            await self._reply_markdown(message, "\n".join([title, "", "**❌ 请提供纯数字 QQ 号（5~12 位）**"]))
+            return
+        ok, msg = self.mail.reset_email_limit(email)
+        _log.warning("[邮箱上限重置] %s 对 %s：%s", self._disp(gid, user_openid), email, msg)
+        await self._reply_markdown(message, "\n".join([
+            title, "",
+            ("✅ **" + msg + "**" if ok else ("❌ " + msg)),
+            "> 该邮箱现在可以重新申请验证码了",
+        ]))
 
-        只接受「纯数字@qq.com」——即 QQ 号本身：这样邮箱能直接对应到人，方便识别与追责开挂用户，
-        同时避免用任意邮箱充当身份凭据（用户口径，2026-10-04）。
-        """
-        # 支持 "绑定邮箱：xxx@qq.com" 和 "绑定邮箱 xxx@qq.com"
-        rest = text[len("绑定邮箱"):].lstrip("：: \t")
-        email = rest.strip().lower()
+    async def cmd_bind_email(self, message, text: str, gid):
+        """绑定 <QQ号>：向 <QQ号>@qq.com 发 6 位验证码。规则集中在 bind_rules.check_bind_request（可单元测试）"""
+        _bp = "绑定" if text.startswith("绑定") else "绑定"
+        rest = text[len(_bp):].lstrip("：: \t")
         try:
             user_openid = message.author.member_openid or ""
         except AttributeError:
             user_openid = ""
-        if not check_qq_email(email):
-            await self._reply_markdown(
-                message,
-                "## ꧁༺ 白名单验证 ༻꧂\n\n"
-                "**❌ 只支持 QQ 邮箱，且必须是「QQ号@qq.com」形式喵**\n\n"
-                "格式：`绑定邮箱 <QQ号>@qq.com`\n"
-                "例：`绑定邮箱 1011819146@qq.com`\n\n"
-                "> 用 QQ 号是为了方便核对与追责，别填其他邮箱喵",
-            )
+        try:
+            union_openid = getattr(getattr(message, "author", None), "union_openid", "") or ""
+        except Exception:
+            union_openid = ""
+        try:
+            import json as _json
+            _vp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify.json")
+            with open(_vp, "r", encoding="utf-8") as _f:
+                _verify_users = (_json.load(_f) or {}).get("users") or {}
+        except Exception:
+            _verify_users = {}
+        allowed, email, reason = check_bind_request(rest, user_openid, union_openid,
+                                                  getattr(self.whitelist_store, "_data", None) or {},
+                                                  _verify_users)
+        _log.info("BIND_CHECK ok=%s oid_len=%d reason_len=%d", allowed, len(user_openid or ""), len(reason or ""))
+        if not allowed:
+            await self._reply_markdown(message, "## ꧁༺ 白名单验证 ༻꧂\n\n"
+                "**❌ " + reason + "**\n\n"
+                "> 首次绑定：`绑定 <你的QQ号>`（例 `绑定 1011819146`）\n"
+                "> 换绑：`邮箱改绑 <新QQ号>`")
             return
         ok, msg, _code = self.mail.request_code(user_openid, email, self._group_name(self._eff_gid(gid)), self.bot_name)
         if ok:
-            await self._reply_markdown(
-                message,
-                "## ꧁༺ 白名单验证 ༻꧂\n\n"
+            await self._reply_markdown(message, "## ꧁༺ 白名单验证 ༻꧂\n\n"
                 f"✅ **验证码已发送到 `{email}`**\n\n"
                 "请查收邮件，然后发送：\n"
                 f"`添加白名单 <进服玩家名> <验证码>`\n\n"
-                "> 验证码5分钟有效，若过期请重新申请喵",
-            )
+                "> 验证码5分钟有效，若过期请重新申请喵")
         else:
-            await self._reply_markdown(
-                message,
-                "## ꧁༺ 白名单验证 ༻꧂\n\n"
-                f"**❌ {msg}**",
-            )
+            await self._reply_markdown(message, "## ꧁༺ 白名单验证 ༻꧂\n\n" + f"**❌ {msg}**")
 
     async def cmd_add_whitelist(self, message, text: str, gid):
         """添加白名单 <进服玩家名> <验证码>：按申请人 QQ 校验验证码并绑定白名单"""
@@ -4996,7 +4652,7 @@ class GroupReviewClient(botpy.Client):
                 message,
                 "## ꧁༺ 白名单绑定 ༻꧂\n\n"
                 f"**❌ {msg}**\n\n"
-                "请先发送 `绑定邮箱 <您的邮箱>` 获取验证码",
+                "请先发送 `绑定 <QQ号>` 获取验证码",
             )
             return
 
@@ -5126,7 +4782,7 @@ class GroupReviewClient(botpy.Client):
 
     async def cmd_change_email(self, message, text: str, gid):
         """邮箱改绑 <新邮箱>（兼容 改绑邮箱 <新邮箱>）：改绑本人白名单的绑定邮箱。
-        规则：原白名单立即作废；24 小时内用新邮箱重新走「绑定邮箱 → 添加白名单」
+        规则：原白名单立即作废；24 小时内用新邮箱重新走「绑定 → 添加白名单」
         才算改绑成功（成功后才真正生效）；超时未完成自动恢复原白名单；7 天限一次。"""
         text = text.lstrip("/").strip()
         rest = ""
@@ -5171,7 +4827,7 @@ class GroupReviewClient(botpy.Client):
                 message,
                 "## ꧁༺ 邮箱改绑 ༻꧂\n\n"
                 "**您已有一个进行中的邮箱改绑喵**\n\n"
-                f"> 请先用 `{ch.get('new_email')}` 完成「绑定邮箱 → 添加白名单」\n"
+                f"> 请先用 `{ch.get('new_email')}` 完成「绑定 → 添加白名单」\n"
                 "> 超过 24 小时未完成会自动恢复原白名单",
             )
             return

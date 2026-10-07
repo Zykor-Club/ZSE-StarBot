@@ -10,6 +10,7 @@
 """
 
 from permissions import (
+    PERM_MAIL_RESET,
     MIN_ROLE, PERM_NEED_LABEL, RANK, MEMBER, OWNER,
     PERM_ROLE_MANAGE, PERM_MAP_TOGGLE, PERM_ONLINE_SHOW,
     PERM_ADD_SERVER, PERM_DEL_SERVER, PERM_MAP_FETCH, PERM_SAY_ALL, PERM_EXEC, PERM_BROADCAST,
@@ -87,7 +88,7 @@ CATEGORIES = [
     {
         "key": "whitelist", "emoji": "📄", "title": "白名单与设备",
         "commands": [
-            ("绑定邮箱", "<邮箱>", "", None, "发送绑定验证码邮件（有频控）"),
+            ("绑定", "<邮箱>", "", None, "发送绑定验证码邮件（有频控）"),
             ("添加白名单", "<玩家名> <验证码>", "", None, "校验验证码并绑定玩家名"),
             ("修改白名单", "<新玩家名>", "", None, "改名：不迁移存档，48 小时限一次"),
             ("邮箱改绑", "<新邮箱>", "改绑邮箱", None, "7 天限一次；24 小时内完成否则回滚"),
@@ -107,6 +108,7 @@ CATEGORIES = [
             ("我的积分", "[玩家名]", "", None, "喵币余额 / 累计 / 连续签到 / 排名"),
             ("积分排行", "[累计] [页码]", "", None, "本联合体系内已绑定玩家的喵币榜"),
             ("发币 / 扣币", "<玩家名> <数量> [原因]", "", PERM_ECON_ADMIN, "高级管理员发放/扣除喵币"),
+            ("邮箱上限重置", "<QQ号>", "", PERM_MAIL_RESET, "清零该邮箱的申请计数与冷却（管理员及以上）"),
             ("重置经济", "确认", "", PERM_ECON_ADMIN, "清零所有人喵币（保留流水）"),
         ],
     },
