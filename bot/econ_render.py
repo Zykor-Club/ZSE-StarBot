@@ -35,7 +35,11 @@ BADGE_TINT = {
 
 
 def _canvas(bg_dir=None, bg_file=None):
-    bg = _pick_bg(bg_dir, bg_file)
+    # 背景兜底：取不到背景图（目录不存在/无图/格式异常）就用纯色，绝不让整张卡渲染失败
+    try:
+        bg = _pick_bg(bg_dir, bg_file)
+    except Exception:
+        bg = None
     if bg is not None and max(bg.size) > BG_MAX_SIDE:
         r = BG_MAX_SIDE / max(bg.size)
         bg = bg.resize((max(1, round(bg.width * r)), max(1, round(bg.height * r))), Image.LANCZOS)
@@ -54,11 +58,16 @@ def _encode(img, overlay, quality=88):
 
 
 def _shrink(measure, txt, size_fn, width, min_px):
+    """按需缩小字号；**保证一定会结束**（字号不再变小时立刻停，防止死循环）"""
     f = size_fn(0)
-    while measure.textlength(txt, font=f) > width and f.size > min_px:
-        f = size_fn(-2)
+    for _ in range(80):
+        if measure.textlength(txt, font=f) <= width or f.size <= min_px:
+            break
+        nxt = size_fn(-2)
+        if nxt.size >= f.size:
+            break
+        f = nxt
     return f
-
 
 def _pill(od, measure, x, y, text, key, s, pad_x, h, max_right):
     """徽章胶囊；放不下返回 None"""
@@ -142,15 +151,15 @@ def render_info_card(name: str, rows, banner: str = "", subtitle: str = "",
     inner = px(30)
     bottom = H - pad - px(46)
     # 行高自适应：按剩余空间摊分，保证不裁行（最小值 40）；字体随行高缩放
-    avail = max(px(40), bottom - y - inner * 2)
-    row_h = px(62) if len(rows) <= 1 else max(px(40), min(px(62), avail // len(rows)))
+    avail = max(px(32), bottom - y - inner * 2)
+    row_h = px(62) if len(rows) <= 1 else max(px(36), min(px(62), avail // len(rows)))
     fscale = min(1.0, row_h / float(px(62)))
     panel_bottom = min(y + inner * 2 + row_h * len(rows), bottom)
     od.rounded_rectangle([pad, y, W - pad, panel_bottom], radius=px(20), fill=PANEL)
     label_w = px(230)
     value_x = pad + inner + label_w
     value_w = max(px(80), W - pad - inner - value_x)
-    lab_f = _font(max(px(22), int(px(32) * fscale)))
+    lab_f = _font(max(px(20), int(px(32) * fscale)))
     yy = y + inner
     for i, (label, value) in enumerate(rows):
         if yy + row_h > panel_bottom:
@@ -158,7 +167,7 @@ def render_info_card(name: str, rows, banner: str = "", subtitle: str = "",
             break
         od.text((pad + inner, yy + int(row_h * 0.22)), clean_text(str(label)), font=lab_f, fill=LABEL)
         txt = clean_text(str(value))
-        vf = _shrink(measure, txt, lambda d: _font(int(px(34) * fscale) + d, bold=True), value_w, px(18))
+        vf = _shrink(measure, txt, lambda d: _font(int(px(34) * fscale) + d, bold=True), value_w, px(16))
         od.text((value_x, yy + int(row_h * 0.16)), _truncate(measure, txt, vf, value_w), font=vf, fill=WHITE)
         if i != len(rows) - 1:
             ly = yy + row_h - px(2)
@@ -180,10 +189,19 @@ def render_rank_card(items, title: str = "积分排行", subtitle: str = "", pag
 
     pad = px(44)
     od.rectangle([0, 0, W, H], fill=SCRIM)
-    od.text((pad, pad), clean_text(str(title)), font=_font(px(50), bold=True), fill=WHITE)
-    sub_f = _font(px(28))
-    ptxt = "第 " + str(page) + " / " + str(total_pages) + " 页" + (" · " + str(subtitle) if subtitle else "")
-    od.text((W - pad, pad + px(16)), clean_text(ptxt), font=sub_f, fill=DIM, anchor="ra")
+    # 标题清洗：去掉 markdown 井号与装饰字符，并限宽 55%，保证不与右上角页码重叠
+    def _plain(s):
+        t = clean_text(str(s or ""))
+        for ch in ("#", "꧁", "༺", "༻", "꧂", "*", "`"):
+            t = t.replace(ch, "")
+        return t.strip()
+
+    title_txt = _plain(title) or "积分排行"
+    title_f = _shrink(measure, title_txt, lambda d: _font(px(50) + d, bold=True), int(W * 0.55), px(30))
+    od.text((pad, pad), _truncate(measure, title_txt, title_f, int(W * 0.55)), font=title_f, fill=WHITE)
+    ptxt = "第 " + str(page) + " / " + str(total_pages) + " 页" + (" · " + _plain(subtitle) if subtitle else "")
+    sub_f = _shrink(measure, ptxt, lambda d: _font(px(28) + d), int(W * 0.40), px(18))
+    od.text((W - pad, pad + px(16)), _truncate(measure, ptxt, sub_f, int(W * 0.40)), font=sub_f, fill=DIM, anchor="ra")
     y = pad + px(80)
     hh = px(48)
     od.rounded_rectangle([pad, y, W - pad, y + hh], radius=px(12), fill=(255, 255, 255, 26))

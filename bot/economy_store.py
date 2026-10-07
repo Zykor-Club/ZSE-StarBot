@@ -114,6 +114,21 @@ class EconomyStore:
                           "ORDER BY id DESC LIMIT 1", (openid,)).fetchone()
             return int(r["ts"]) if r else 0
 
+    def last_play_hour(self, openid: str) -> int:
+        """在线时长已结算到第几个小时（从流水 ref 推导；参数化 SQL，无需转义）"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT ref FROM economy_log WHERE openid = ? AND reason = ? AND ref LIKE ? "
+                "ORDER BY id DESC LIMIT 60",
+                (openid, "playtime", "playtime:%")).fetchall()
+        best = 0
+        for r in rows:
+            try:
+                best = max(best, int(str(r["ref"]).rsplit(":", 1)[-1]))
+            except (TypeError, ValueError):
+                continue
+        return best
+
     def rank_of(self, openid: str, by: str = "balance") -> int:
         col = "total_earned" if by == "earned" else "balance"
         with self._conn() as c:
