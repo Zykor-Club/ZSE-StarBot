@@ -43,3 +43,9 @@ fix_lock_restart.py
 # ===== 预览图 =====
 preview.png
 preview2.png
+# 本地测试与部署（不上传）
+tests/
+scripts/verify_deploy.py
+scripts/deploy_*.py
+scripts/deploy_config.json
+docs/审查报告-*.md
